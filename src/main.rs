@@ -59,6 +59,7 @@ fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, c
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"session-scheduler","version":"0.1.0"}}}),
         )?;
         let mut phase = 1;
+        let mut acp_session_id: Option<String> = None;
         for line in BufReader::new(output).lines() {
             let line = line?;
             let message: Value = serde_json::from_str(&line).map_err(io::Error::other)?;
@@ -71,13 +72,42 @@ fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, c
                         )?;
                     }
                 } else if method == "session/update" {
+                    if message["params"]["sessionId"].as_str() != acp_session_id.as_deref()
+                        || acp_session_id.is_none()
+                    {
+                        continue;
+                    }
                     let u = &message["params"]["update"];
-                    if u["sessionUpdate"] == "agent_message_chunk" {
+                    if u["sessionUpdate"] == "agent_message_chunk" && u["content"]["type"] == "text"
+                    {
                         if let Some(text) = u["content"]["text"].as_str() {
                             update(&sessions, &id, |s| {
                                 let old = s["result"].as_str().unwrap_or("");
                                 s["result"] = json!(format!("{old}{text}"));
+                                let history = s["history"].as_array_mut().unwrap();
+                                if let Some(last) =
+                                    history.last_mut().filter(|entry| entry["role"] == "agent")
+                                {
+                                    let old = last["text"].as_str().unwrap_or("");
+                                    last["text"] = json!(format!("{old}{text}"));
+                                } else {
+                                    history.push(json!({"role":"agent", "text":text}));
+                                }
                             });
+                        }
+                    } else if matches!(
+                        u["sessionUpdate"].as_str(),
+                        Some("tool_call" | "tool_call_update")
+                    ) {
+                        if let (Some(tool_id), Some(status)) =
+                            (u["toolCallId"].as_str(), u["status"].as_str())
+                        {
+                            if matches!(status, "pending" | "in_progress" | "completed" | "failed")
+                            {
+                                update(&sessions, &id, |s| {
+                                    s["history"].as_array_mut().unwrap().push(json!({"type":"tool_call", "tool_call_id":tool_id, "status":status}))
+                                });
+                            }
                         }
                     }
                 } else if let Some(request_id) = message.get("id") {
@@ -108,6 +138,7 @@ fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, c
                         .as_str()
                         .ok_or_else(|| io::Error::other("missing ACP session"))?;
                     update(&sessions, &id, |s| s["acp_session_id"] = json!(acp_id));
+                    acp_session_id = Some(acp_id.to_owned());
                     // The running turn is already visible before sending the prompt.
                     submitted = true;
                     send(
@@ -121,13 +152,12 @@ fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, c
                         .as_str()
                         .ok_or_else(|| io::Error::other("missing stop reason"))?;
                     update(&sessions, &id, |s| {
-                        s["status"] = json!(if reason == "cancelled" {
-                            "cancelled"
-                        } else {
-                            "completed"
+                        s["status"] = json!(match reason {
+                            "end_turn" => "completed",
+                            "cancelled" => "cancelled",
+                            _ => "failed",
                         });
                         s["stop_reason"] = json!(reason);
-                        s["history"] = json!([{ "role":"agent", "text":s["result"] }]);
                     });
                     return Ok(());
                 }
@@ -139,7 +169,6 @@ fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, c
     if run().is_err() {
         update(&sessions, &id, |s| {
             s["status"] = json!(if submitted { "unknown" } else { "failed" });
-            s["history"] = json!([{ "role":"agent", "text":s["result"] }]);
         });
     }
 }
@@ -165,10 +194,17 @@ fn main() {
             continue;
         };
         let method = request["method"].as_str().unwrap_or("");
+        let mut launch = None;
         let response = match method {
             "initialize" => {
-                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"session-scheduler","version":"0.1.0"}})
+                let version = if request["params"]["protocolVersion"] == "2025-03-26" {
+                    "2025-03-26"
+                } else {
+                    "2025-11-25"
+                };
+                json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"session-scheduler","version":"0.1.0"}})
             }
+            "ping" => json!({}),
             "tools/list" => {
                 json!({"tools":[{"name":"delegate","description":"Delegate work to Codex","inputSchema":{"type":"object","properties":{"workspace":{"type":"string"},"prompt":{"type":"string"}},"required":["workspace","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
             }
@@ -180,7 +216,7 @@ fn main() {
                             .lock()
                             .unwrap()
                             .values()
-                            .cloned()
+                            .map(|s| json!({"session_id":s["session_id"],"turn_id":s["turn_id"],"workspace":s["workspace"],"status":s["status"]}))
                             .collect::<Vec<_>>()),
                         false,
                     ),
@@ -204,14 +240,12 @@ fn main() {
                             let workspace = path.unwrap();
                             let sid = Uuid::new_v4().to_string();
                             let tid = Uuid::new_v4().to_string();
-                            let record = json!({"session_id":sid,"turn_id":tid,"workspace":workspace,"status":"running","result":"","history":[],"acp_session_id":null,"stop_reason":null});
+                            let record = json!({"session_id":sid,"turn_id":tid,"workspace":workspace,"status":"running","result":"","history":[{"role":"user","text":prompt}],"acp_session_id":null,"stop_reason":null});
                             sessions.lock().unwrap().insert(sid.clone(), record);
                             let shared = Arc::clone(&sessions);
                             let worker_id = sid.clone();
                             let prompt = prompt.to_owned();
-                            thread::spawn(move || {
-                                run_acp(shared, worker_id, workspace, prompt, command)
-                            });
+                            launch = Some((shared, worker_id, workspace, prompt, command));
                             result(json!({"session_id":sid,"turn_id":tid}), false)
                         } else {
                             result(json!("Adapter or prompt unavailable"), true)
@@ -227,7 +261,17 @@ fn main() {
                 continue;
             }
         };
-        println!("{}", json!({"jsonrpc":"2.0","id":id,"result":response}));
-        let _ = io::stdout().flush();
+        let mut stdout = io::stdout().lock();
+        if send(
+            &mut stdout,
+            json!({"jsonrpc":"2.0","id":id,"result":response}),
+        )
+        .is_err()
+        {
+            break;
+        }
+        if let Some((shared, worker_id, workspace, prompt, command)) = launch {
+            thread::spawn(move || run_acp(shared, worker_id, workspace, prompt, command));
+        }
     }
 }
