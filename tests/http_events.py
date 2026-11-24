@@ -35,7 +35,7 @@ class RecoveringReceiver(Receiver):
 
 
 class HttpEvents(unittest.TestCase):
-    def test_pending_completion_survives_scheduler_restart(self):
+    def test_completion_waits_for_storage_and_survives_scheduler_restart(self):
         with ExitStack() as cleanup:
             receiver = cleanup.enter_context(ThreadingHTTPServer(('127.0.0.1', 0), RecoveringReceiver))
             state = cleanup.enter_context(tempfile.TemporaryDirectory())
@@ -84,9 +84,15 @@ class HttpEvents(unittest.TestCase):
                 except queue.Empty:
                     self.fail(f'receiver did not observe a completion attempt {phase} within 5 seconds')
 
+            log_path = Path(state) / 'scheduler.log'
+            log = cleanup.enter_context(log_path.open('wb'))
+
             def start():
-                return subprocess.Popen([BIN], env=env, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL)
+                return subprocess.Popen([BIN], env=env, stdout=subprocess.DEVNULL, stderr=log)
+
+            def call(name, arguments):
+                result = rpc('tools/call', {'name': name, 'arguments': arguments})
+                return result['isError'], json.loads(result['content'][0]['text'])
 
             with start() as scheduler:
                 try:
@@ -95,11 +101,36 @@ class HttpEvents(unittest.TestCase):
                         'name': 'turn.completed', 'arguments': {},
                         'delivery': {'mode': 'webhook', 'url': callback, 'secret': SECRET},
                     })
-                    delegated = rpc('tools/call', {
-                        'name': 'delegate', 'arguments': {'workspace': state, 'prompt': 'pong'},
-                    })
-                    ids = json.loads(delegated['content'][0]['text'])
+                    # A directory at the destination makes the real atomic replacement fail.
+                    pending_path = Path(state) / 'pending-events.json'
+                    pending_path.mkdir()
+                    error, ids = call('delegate', {'workspace': state, 'prompt': 'pong'})
+                    self.assertFalse(error)
+                    session = {'session_id': ids['session_id']}
+                    diagnostic = f'could not persist completion of turn {ids["turn_id"]}:'
+                    deadline = time.monotonic() + 5
+                    while diagnostic not in log_path.read_text():
+                        if time.monotonic() >= deadline:
+                            self.fail('scheduler did not report the local persistence failure')
+                        time.sleep(.02)
+
+                    error, record = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual((record['status'], record['stop_reason']),
+                                     ('completion_pending', None))
+                    self.assertEqual(call('follow_up', dict(session, prompt='recall')),
+                                     (True, 'Session is not available'))
+                    with self.assertRaises(queue.Empty):
+                        receiver.attempts.get(timeout=1.5)
+
+                    pending_path.rmdir()
                     status, event_id, subscription_id, event = next_attempt('before restart')
+                    error, record = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual((record['status'], record['stop_reason']),
+                                     ('completed', 'end_turn'))
+                    self.assertEqual([entry['event_id'] for entry in json.loads(pending_path.read_text())],
+                                     [event_id])
                     self.assertEqual(status, 503)
                     self.assertEqual(subscription_id, subscription['id'])
                     self.assertEqual(event['eventId'], event_id)

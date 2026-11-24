@@ -64,7 +64,7 @@ impl PendingEvent {
 
 struct PendingEvents {
     entries: Vec<PendingEvent>,
-    needs_sync: bool,
+    publish_after_sync: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 pub struct Events {
@@ -224,7 +224,7 @@ impl Events {
             subscriptions: Mutex::new(subscriptions),
             pending: Mutex::new(PendingEvents {
                 entries: pending,
-                needs_sync: false,
+                publish_after_sync: Vec::new(),
             }),
         };
         if let Some(url) = &service.callback {
@@ -495,7 +495,13 @@ impl Events {
             json!({"id":id,"refreshBefore":expires.to_rfc3339_opts(chrono::SecondsFormat::AutoSi,true),"cursor":null,"truncated":false}),
         )
     }
-    pub fn complete(&self, session_id: &str, turn_id: &str, reason: &str) {
+    pub fn complete(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        reason: &str,
+        publish: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
         if session_id.is_empty()
             || turn_id.is_empty()
             || session_id.len() > 128
@@ -516,14 +522,12 @@ impl Events {
                     | "cancelled"
             )
         {
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid turn completion",
+            ));
         }
-        if let Err(error) = self.enqueue_completion(session_id, turn_id, reason) {
-            eprintln!("could not persist turn completion event: {error}");
-        }
-    }
 
-    fn enqueue_completion(&self, session_id: &str, turn_id: &str, reason: &str) -> io::Result<()> {
         let subscriptions = self
             .subscriptions
             .lock()
@@ -543,6 +547,7 @@ impl Events {
             .collect::<Vec<_>>();
         drop(subscriptions);
         if events.is_empty() {
+            publish();
             return Ok(());
         }
 
@@ -551,14 +556,17 @@ impl Events {
             .lock()
             .map_err(|_| io::Error::other("pending events lock poisoned"))?;
         pending.entries.extend(events);
-        pending.needs_sync = true;
+        pending.publish_after_sync.push(Box::new(publish));
         self.sync_pending(&mut pending)
     }
 
     fn sync_pending(&self, pending: &mut PendingEvents) -> io::Result<()> {
-        if pending.needs_sync {
+        if !pending.publish_after_sync.is_empty() {
             self.persist_pending(&pending.entries)?;
-            pending.needs_sync = false;
+            // Publish before the delivery worker can take a snapshot of these events.
+            for publish in pending.publish_after_sync.drain(..) {
+                publish();
+            }
         }
         Ok(())
     }
@@ -603,11 +611,11 @@ impl Events {
                 .pending
                 .lock()
                 .map_err(|_| io::Error::other("pending events lock poisoned"))?;
+            self.sync_pending(&mut pending)?;
             let mut next = pending.entries.clone();
             next.retain(|event| !finished.contains(&event.event_id));
             self.persist_pending(&next)?;
             pending.entries = next;
-            pending.needs_sync = false;
         }
         Ok(())
     }
