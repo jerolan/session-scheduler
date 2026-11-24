@@ -30,15 +30,18 @@ pub fn serve() -> io::Result<()> {
         .filter(|s| !s.is_empty() && !s.contains(['\r', '\n']))
         .ok_or_else(|| io::Error::other("missing bearer token"))?;
     let events = Arc::new(Events::from_env()?);
-    let cleanup_events = events.clone();
+    let server = Server::http(("127.0.0.1", port)).map_err(io::Error::other)?;
+    let worker_events = events.clone();
     thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_secs(1));
-        if let Err(error) = cleanup_events.cleanup() {
+        if let Err(error) = worker_events.cleanup() {
             eprintln!("event cleanup failed: {error}");
         }
+        if let Err(error) = worker_events.deliver_pending() {
+            eprintln!("pending event delivery failed: {error}");
+        }
+        thread::sleep(std::time::Duration::from_secs(1));
     });
     let state = Arc::new(State::new(Some(events)));
-    let server = Server::http(("127.0.0.1", port)).map_err(io::Error::other)?;
     for mut request in server.incoming_requests() {
         let state = state.clone();
         let token = token.clone();

@@ -254,14 +254,8 @@ fn run_acp(job: AcpJob) {
                             "end_turn" | "cancelled" | "refusal" | "max_tokens"
                             | "max_turn_requests" => reason,
                             _ => "failed",
-                        }
-                        .to_owned();
-                        let events = events.clone();
-                        let session_id = id.clone();
-                        let turn_id = turn.id.clone();
-                        thread::spawn(move || {
-                            events.complete(&session_id, &turn_id, &event_reason)
-                        });
+                        };
+                        events.complete(&id, &turn.id, event_reason);
                     }
                     turn = loop {
                         match receiver.recv_timeout(Duration::from_millis(100)) {

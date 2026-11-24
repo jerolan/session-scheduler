@@ -11,7 +11,19 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[path = "state_windows.rs"]
 mod windows;
 
-const SUBSCRIPTIONS: &str = "event-subscriptions.json";
+pub enum StateFile {
+    Subscriptions,
+    PendingEvents,
+}
+
+impl StateFile {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Subscriptions => "event-subscriptions.json",
+            Self::PendingEvents => "pending-events.json",
+        }
+    }
+}
 
 pub struct StateFiles {
     directory: PathBuf,
@@ -42,8 +54,8 @@ impl StateFiles {
         Ok(Self { directory, access })
     }
 
-    pub fn subscriptions(&self) -> io::Result<Option<File>> {
-        let path = self.directory.join(SUBSCRIPTIONS);
+    pub fn read(&self, kind: StateFile) -> io::Result<Option<File>> {
+        let path = self.directory.join(kind.name());
         #[cfg(unix)]
         let result = match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() && meta.permissions().mode() & 0o077 == 0 => {
@@ -64,8 +76,9 @@ impl StateFiles {
         }
     }
 
-    pub fn replace_subscriptions(
+    pub fn replace(
         &self,
+        kind: StateFile,
         write: impl FnOnce(&mut File) -> io::Result<()>,
     ) -> io::Result<()> {
         let temporary = self.directory.join(format!(".events-{}", Uuid::new_v4()));
@@ -85,10 +98,17 @@ impl StateFiles {
         })();
         drop(file);
 
-        let destination = self.directory.join(SUBSCRIPTIONS);
+        let destination = self.directory.join(kind.name());
         let result = result.and_then(|()| {
             #[cfg(unix)]
-            return fs::rename(&temporary, &destination);
+            return {
+                if matches!(kind, StateFile::Subscriptions) {
+                    return fs::rename(&temporary, &destination);
+                }
+                let directory = File::open(&self.directory)?;
+                fs::rename(&temporary, &destination)?;
+                directory.sync_all()
+            };
             #[cfg(windows)]
             return self.access.replace(&temporary, &destination);
         });

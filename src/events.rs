@@ -1,3 +1,4 @@
+use crate::state_files::{StateFile, StateFiles};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hmac::{Hmac, Mac};
@@ -5,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     env,
     io::{self, Read},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
@@ -34,14 +36,46 @@ struct Subscription {
     verified_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingEvent {
+    subscription_id: String,
+    event_id: String,
+    timestamp: String,
+    session_id: String,
+    turn_id: String,
+    reason: String,
+}
+
+impl PendingEvent {
+    fn body(&self) -> Value {
+        json!({
+            "eventId": self.event_id,
+            "name": NAME,
+            "timestamp": self.timestamp,
+            "data": {
+                "session_id": self.session_id,
+                "turn_id": self.turn_id,
+                "reason": self.reason,
+            },
+            "cursor": null,
+        })
+    }
+}
+
+struct PendingEvents {
+    entries: Vec<PendingEvent>,
+    needs_sync: bool,
+}
+
 pub struct Events {
     account: String,
-    state: crate::state_files::StateFiles,
+    state: StateFiles,
     callback: Option<String>,
     callback_host: Option<String>,
     ip: Option<IpAddr>,
     loopback: bool,
     subscriptions: Mutex<Vec<Subscription>>,
+    pending: Mutex<PendingEvents>,
 }
 
 fn invalid() -> Value {
@@ -141,8 +175,8 @@ impl Events {
                 "SESSION_SCHEDULER_STATE_DIR required",
             )
         })?);
-        let state = crate::state_files::StateFiles::open(dir)?;
-        let subscriptions: Vec<Subscription> = match state.subscriptions()? {
+        let state = StateFiles::open(dir)?;
+        let subscriptions: Vec<Subscription> = match state.read(StateFile::Subscriptions)? {
             Some(file) => serde_json::from_reader(file).map_err(io::Error::other)?,
             None => Vec::new(),
         };
@@ -152,6 +186,10 @@ impl Events {
                 "state belongs to another account",
             ));
         }
+        let pending = match state.read(StateFile::PendingEvents)? {
+            Some(file) => serde_json::from_reader(file).map_err(io::Error::other)?,
+            None => Vec::new(),
+        };
         let callback = env::var("SESSION_SCHEDULER_CALLBACK_URL").ok();
         let ip = env::var("SESSION_SCHEDULER_CALLBACK_IP")
             .ok()
@@ -184,6 +222,10 @@ impl Events {
             ip,
             loopback,
             subscriptions: Mutex::new(subscriptions),
+            pending: Mutex::new(PendingEvents {
+                entries: pending,
+                needs_sync: false,
+            }),
         };
         if let Some(url) = &service.callback {
             service.target(url).map_err(|_| {
@@ -223,7 +265,7 @@ impl Events {
         Ok((url, Some(ip)))
     }
     fn persist(&self, subs: &[Subscription]) -> io::Result<()> {
-        self.state.replace_subscriptions(|file| {
+        self.state.replace(StateFile::Subscriptions, |file| {
             serde_json::to_writer(file, subs).map_err(io::Error::other)
         })
     }
@@ -476,43 +518,98 @@ impl Events {
         {
             return;
         }
-        if self.cleanup().is_err() {
-            return;
+        if let Err(error) = self.enqueue_completion(session_id, turn_id, reason) {
+            eprintln!("could not persist turn completion event: {error}");
         }
-        let eligible = match self.subscriptions.lock() {
-            Ok(lock) => lock
-                .iter()
-                .filter(|s| s.expires > Utc::now() && s.account == self.account)
-                .cloned()
-                .collect::<Vec<_>>(),
-            Err(_) => return,
+    }
+
+    fn enqueue_completion(&self, session_id: &str, turn_id: &str, reason: &str) -> io::Result<()> {
+        let subscriptions = self
+            .subscriptions
+            .lock()
+            .map_err(|_| io::Error::other("subscription lock poisoned"))?;
+        let now = Utc::now();
+        let events = subscriptions
+            .iter()
+            .filter(|sub| sub.expires > now)
+            .map(|sub| PendingEvent {
+                subscription_id: sub.id.clone(),
+                event_id: format!("evt_{}", Uuid::new_v4()),
+                timestamp: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                session_id: session_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                reason: reason.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        drop(subscriptions);
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| io::Error::other("pending events lock poisoned"))?;
+        pending.entries.extend(events);
+        pending.needs_sync = true;
+        self.sync_pending(&mut pending)
+    }
+
+    fn sync_pending(&self, pending: &mut PendingEvents) -> io::Result<()> {
+        if pending.needs_sync {
+            self.persist_pending(&pending.entries)?;
+            pending.needs_sync = false;
+        }
+        Ok(())
+    }
+
+    fn persist_pending(&self, pending: &[PendingEvent]) -> io::Result<()> {
+        self.state.replace(StateFile::PendingEvents, |file| {
+            serde_json::to_writer(file, pending).map_err(io::Error::other)
+        })
+    }
+
+    // Only the delivery worker calls this. Queue writes can proceed while it sends.
+    pub fn deliver_pending(&self) -> io::Result<()> {
+        let batch = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| io::Error::other("pending events lock poisoned"))?;
+            self.sync_pending(&mut pending)?;
+            pending.entries.clone()
         };
-        for sub in &eligible {
-            let id = format!("evt_{}", Uuid::new_v4());
-            let event = json!({"eventId":id,"name":NAME,"timestamp":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,true),"data":{"session_id":session_id,"turn_id":turn_id,"reason":reason},"cursor":null});
-            for attempt in 0..3 {
-                if self.cleanup().is_err() {
-                    break;
-                }
-                let current = match self.subscriptions.lock() {
-                    Ok(lock) => lock
-                        .iter()
-                        .find(|s| s.id == sub.id && s.expires > Utc::now())
-                        .cloned(),
-                    Err(_) => None,
-                };
-                let Some(current) = current else { break };
-                match self.send(&current, &id, &event) {
-                    Ok(_) | Err("permanent") | Err("challenge_failed") | Err("invalid_url") => {
-                        break
-                    }
-                    _ if attempt < 2 => {
-                        std::thread::sleep(Duration::from_millis(200 * (1 << attempt)))
-                    }
-                    _ => break,
+        let mut finished = HashSet::new();
+        for event in batch {
+            let current = self
+                .subscriptions
+                .lock()
+                .map_err(|_| io::Error::other("subscription lock poisoned"))?
+                .iter()
+                .find(|sub| sub.id == event.subscription_id && sub.expires > Utc::now())
+                .cloned();
+            if let Some(sub) = current {
+                if matches!(
+                    self.send(&sub, &event.event_id, &event.body()),
+                    Err("transient" | "timeout")
+                ) {
+                    continue;
                 }
             }
+            finished.insert(event.event_id);
         }
+        if !finished.is_empty() {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| io::Error::other("pending events lock poisoned"))?;
+            let mut next = pending.entries.clone();
+            next.retain(|event| !finished.contains(&event.event_id));
+            self.persist_pending(&next)?;
+            pending.entries = next;
+            pending.needs_sync = false;
+        }
+        Ok(())
     }
 }
 
