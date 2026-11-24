@@ -14,24 +14,30 @@ class Receiver(BaseHTTPRequestHandler):
         self.server.messages.put((json.loads(body), self.headers.get('webhook-signature'), 'v1,'+signature, self.headers.get('X-MCP-Subscription-Id')))
         payload=json.loads(body)
         response=json.dumps({'challenge': 'wrong' if self.server.wrong else payload.get('challenge')}).encode()
-        self.send_response(200); self.send_header('Content-Length',str(len(response))); self.end_headers(); self.wfile.write(response)
+        self.send_response(getattr(self.server, 'response_status', 200))
+        self.send_header('Content-Length',str(len(response))); self.end_headers(); self.wfile.write(response)
     def log_message(self, *args): pass
 class RecoveringReceiver(Receiver):
     def do_POST(self):
-        payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        payload = json.loads(body)
         if payload.get('type') == 'verification':
             status = 200
             response = json.dumps({'challenge': payload['challenge']}).encode()
         else:
-            status = 200 if self.server.recovered.is_set() else 503
+            status = 200 if self.server.recovered.is_set() else self.server.failure_status
             response = b''
+            event_id = self.headers['webhook-id']
+            timestamp = self.headers['webhook-timestamp']
+            digest = hmac.digest(KEY, f'{event_id}.{timestamp}.'.encode() + body, 'sha256')
+            expected_signature = 'v1,' + base64.b64encode(digest).decode()
+            signed = hmac.compare_digest(self.headers.get('webhook-signature', ''), expected_signature)
         self.send_response(status)
         self.send_header('Content-Length', str(len(response)))
         self.end_headers()
         self.wfile.write(response)
         if payload.get('type') != 'verification':
-            self.server.attempts.put((status, self.headers['webhook-id'],
-                                      self.headers['X-MCP-Subscription-Id'], payload))
+            self.server.attempts.put((status, event_id, self.headers['X-MCP-Subscription-Id'], payload, signed))
 
 
 class HttpEvents(unittest.TestCase):
@@ -43,15 +49,29 @@ class HttpEvents(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.check_durable_completion(prompt, final_status, reason)
 
+    def test_request_timeout_retains_signed_completion_across_restart(self):
+        self.check_durable_completion('pong', 'completed', 'end_turn', failure_status=408)
+
+    def test_rate_limited_completion_survives_scheduler_restart(self):
+        self.check_durable_completion('pong', 'completed', 'end_turn', failure_status=429)
+
+    def test_permanently_rejected_completion_is_not_retried(self):
+        for status in (410, 413):
+            with self.subTest(status=status):
+                self.check_durable_completion('pong', 'completed', 'end_turn',
+                                              failure_status=status, retry=False)
+
     def test_recovery_notice_survives_scheduler_restart(self):
         self.check_durable_completion('recover_manual', 'unknown', 'outcome_unknown',
                                       event_name='turn.recovery_required')
 
-    def check_durable_completion(self, prompt, final_status, reason, event_name='turn.completed'):
+    def check_durable_completion(self, prompt, final_status, reason, event_name='turn.completed',
+                                 *, failure_status=503, retry=True):
         with ExitStack() as cleanup:
             receiver = cleanup.enter_context(ThreadingHTTPServer(('127.0.0.1', 0), RecoveringReceiver))
             state = cleanup.enter_context(tempfile.TemporaryDirectory())
             receiver.attempts = queue.Queue()
+            receiver.failure_status = failure_status
             receiver.recovered = threading.Event()
             threading.Thread(target=receiver.serve_forever, daemon=True).start()
             cleanup.callback(receiver.shutdown)
@@ -92,9 +112,11 @@ class HttpEvents(unittest.TestCase):
 
             def next_attempt(phase):
                 try:
-                    return receiver.attempts.get(timeout=5)
+                    attempt = receiver.attempts.get(timeout=5)
                 except queue.Empty:
                     self.fail(f'receiver did not observe a completion attempt {phase} within 5 seconds')
+                self.assertTrue(attempt[-1], 'webhook signature did not match the received body')
+                return attempt[:-1]
 
             log_path = Path(state) / 'scheduler.log'
             log = cleanup.enter_context(log_path.open('wb'))
@@ -161,9 +183,7 @@ class HttpEvents(unittest.TestCase):
                     self.assertFalse(error)
                     self.assertEqual((record['status'], record['stop_reason']),
                                      (final_status, None if final_status == 'unknown' else reason))
-                    self.assertEqual([entry['event_id'] for entry in json.loads(pending_path.read_text())],
-                                     [event_id])
-                    self.assertEqual(status, 503)
+                    self.assertEqual(status, failure_status)
                     self.assertEqual(subscription_id, subscription['id'])
                     self.assertEqual(event['eventId'], event_id)
                     self.assertEqual(event['name'], event_name)
@@ -181,23 +201,41 @@ class HttpEvents(unittest.TestCase):
                         self.assertTrue(archived['archived'])
                         self.assertEqual((archived['status'], archived['stop_reason']),
                                          (final_status, reason))
+                    # A second request proves the worker processed the first response.
+                    # If it dropped the event, wait for that decision to reach disk before restarting.
+                    deadline = time.monotonic() + 5
+                    while receiver.attempts.empty() and json.loads(pending_path.read_text()):
+                        if time.monotonic() >= deadline:
+                            self.fail(f'outbox did not settle after HTTP {failure_status}')
+                        time.sleep(.02)
+                    persisted = json.loads(pending_path.read_text())
                 finally:
                     scheduler.kill()
-            # Any requests already accepted by the old process are excluded from replay.
-            while not receiver.attempts.empty():
-                self.assertEqual(receiver.attempts.get_nowait(), (503, event_id, subscription_id, event))
+            receiver.recovered.set()
             with start() as scheduler:
                 try:
                     wait_for_scheduler()
                     self.assertEqual(call('list_sessions', {}), (False, []))
                     self.assertEqual(call('inspect_session', session), (True, 'Session not found'))
-                    self.assertEqual(next_attempt('after restart'), (503, event_id, subscription_id, event))
-                    receiver.recovered.set()
-                    status, retried_id, retried_subscription, retried_event = next_attempt('after recovery')
+                    if not retry:
+                        self.assertEqual(persisted, [])
+                        with self.assertRaises(queue.Empty):
+                            receiver.attempts.get(timeout=1.5)
+                        return
+                    status, retried_id, retried_subscription, retried_event = next_attempt(
+                        f'after restart (HTTP {failure_status}, {len(persisted)} pending on disk)')
+                    while status == failure_status:
+                        self.assertEqual((retried_id, retried_subscription, retried_event),
+                                         (event_id, subscription_id, event))
+                        status, retried_id, retried_subscription, retried_event = next_attempt('after restart')
+                    self.assertEqual([(entry['event_id'], entry['subscription_id'], entry['session_id'],
+                                       entry['turn_id']) for entry in persisted],
+                                     [(event_id, subscription_id, ids['session_id'], ids['turn_id'])])
                     self.assertEqual((status, retried_id, retried_subscription, retried_event),
                                      (200, event_id, subscription_id, event))
                     with self.assertRaises(queue.Empty):
                         receiver.attempts.get(timeout=1.5)
+                    self.assertEqual(json.loads(pending_path.read_text()), [])
                 finally:
                     scheduler.kill()
 
@@ -658,6 +696,17 @@ class HttpEvents(unittest.TestCase):
                 subscription={'name':'turn.completed','arguments':{},'delivery':{'mode':'webhook','url':callback,'secret':SECRET}}
                 bad=json.loads(json.dumps(subscription)); bad['delivery']['url']=callback+'-unlisted'
                 self.assertIn('error',rpc('events/subscribe',bad))
+                receiver.wrong = False
+                receiver.response_status = 408
+                self.assertEqual(rpc('events/subscribe', subscription)['error'], {
+                    'code': -32015, 'message': 'CallbackEndpointError',
+                    'data': {'reason': 'challenge_failed'},
+                })
+                challenge, sig, expected, _ = receiver.messages.get(timeout=3)
+                self.assertEqual(challenge['type'], 'verification')
+                self.assertEqual(sig, expected)
+                receiver.response_status = 200
+                receiver.wrong = True
                 self.assertIn('error',rpc('events/subscribe',subscription))
                 challenge, sig, expected, _=receiver.messages.get(timeout=3)
                 self.assertEqual(challenge['type'],'verification'); self.assertEqual(sig,expected)

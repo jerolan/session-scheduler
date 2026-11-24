@@ -375,10 +375,11 @@ impl Events {
                     "transient"
                 }
             })?;
-        if !response.status().is_success() {
-            return Err(if matches!(response.status().as_u16(), 410 | 413) {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(if matches!(status.as_u16(), 410 | 413) {
                 "permanent"
-            } else if response.status().is_server_error() || response.status().as_u16() == 429 {
+            } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
                 "transient"
             } else {
                 "challenge_failed"
