@@ -42,6 +42,7 @@ Session Scheduler será una herramienta escrita en Rust que expone un plugin MCP
 - Session Scheduler y su servidor MCP se escribirán en Rust. Codex CLI y OpenCode son los dos agentes iniciales vía ACP.
 - Cada sesión delegada pertenece a un workspace. El scheduler usa el workspace que le proporciona el entorno al abrir o reconectar la sesión. El entorno se encarga de prepararlo. La concurrencia entre sesiones depende del workspace.
 - El flujo inicial admite delegar desde Windows y el uso de carpetas proxy cuyos repositorios canónicos se trabajan por SSH.
+- Para la integración privada, Session Scheduler, su estado persistente, tunnel-client y Codex Desktop se ejecutan de forma nativa en Windows. La VM Linux aloja el repositorio de desarrollo y los workspaces a los que se accede por SSH.
 - MCP es la interfaz principal. Expone delegación, listado, inspección, seguimiento, cancelación, archivado y reconexión de sesiones gestionadas. El registro conserva la relación entre workspace, sesión del scheduler, sesión ACP y turnos.
 - El scheduler registra el turno antes de enviarlo y conserva su resultado cuando está disponible. Un encargo de seguimiento mantiene la sesión y recibe otro ID de turno.
 - Las solicitudes de permiso interactivo se deniegan. El archivado de una sesión con trabajo activo requiere cancelar y esperar el desenlace del turno.

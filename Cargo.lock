@@ -899,6 +899,7 @@ dependencies = [
  "tiny_http",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

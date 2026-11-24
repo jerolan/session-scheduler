@@ -24,4 +24,10 @@ Dot delega trabajo a Codex CLI y OpenCode mediante un plugin MCP. Session Schedu
 
 ## Primera validación de la integración
 
+Session Scheduler y tunnel-client se ejecutan de forma nativa en Windows, en el mismo equipo que Codex Desktop. El scheduler escucha en loopback y guarda su estado en una unidad local de Windows. La VM Linux aloja el repositorio de desarrollo y los workspaces a los que acceden las sesiones mediante SSH.
+
+En Windows, `SESSION_SCHEDULER_STATE_DIR` debe señalar una ruta absoluta cuyo directorio padre ya exista y cuyos componentes no tengan puntos de reanálisis. El scheduler puede crear el directorio de estado con una DACL protegida para su cuenta de Windows. Si ya existe, comprueba la DACL antes de leer el estado.
+
+La prueba local usa el ejecutable de Windows, un fixture ACP nativo y un receptor en loopback. Ejecutar `pwsh -File tests/windows_private_events_smoke.ps1 -SchedulerExe <exe> -FixtureExe <exe>` para verificar la firma y la correlación de los eventos, el estado tras un reinicio y las restricciones de acceso con una configuración desechable.
+
 Conectar un plugin privado a Dot mediante Secure MCP Tunnel y verificar que Dot puede suscribirse, delegar un turno, recibir su evento y consultar la sesión. Repetir el recorrido con Codex CLI y OpenCode.

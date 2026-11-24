@@ -4,12 +4,9 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::{
     env,
-    fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::Mutex,
@@ -39,7 +36,7 @@ struct Subscription {
 
 pub struct Events {
     account: String,
-    state: PathBuf,
+    state: crate::state_files::StateFiles,
     callback: Option<String>,
     ip: Option<IpAddr>,
     loopback: bool,
@@ -93,14 +90,6 @@ fn constant_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 impl Events {
-    #[cfg(not(unix))]
-    pub fn from_env() -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "private HTTP state requires Unix permissions",
-        ))
-    }
-    #[cfg(unix)]
     pub fn from_env() -> io::Result<Self> {
         let account = env::var("SESSION_SCHEDULER_ACCOUNT").map_err(|_| {
             io::Error::new(
@@ -120,29 +109,10 @@ impl Events {
                 "SESSION_SCHEDULER_STATE_DIR required",
             )
         })?);
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(&dir)?;
-        let metadata = fs::symlink_metadata(&dir)?;
-        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "state directory must be private",
-            ));
-        }
-        let state = dir.join("event-subscriptions.json");
-        let subscriptions: Vec<Subscription> = match fs::symlink_metadata(&state) {
-            Ok(meta) if meta.file_type().is_file() && meta.permissions().mode() & 0o077 == 0 => {
-                serde_json::from_slice(&fs::read(&state)?).map_err(io::Error::other)?
-            }
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "state file must be private",
-                ))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e),
+        let state = crate::state_files::StateFiles::open(dir)?;
+        let subscriptions: Vec<Subscription> = match state.subscriptions()? {
+            Some(file) => serde_json::from_reader(file).map_err(io::Error::other)?,
+            None => Vec::new(),
         };
         if subscriptions.iter().any(|s| s.account != account) {
             return Err(io::Error::new(
@@ -204,34 +174,10 @@ impl Events {
         }
         Ok((url, ip))
     }
-    #[cfg(not(unix))]
-    fn persist(&self, _subs: &[Subscription]) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "private HTTP state requires Unix permissions",
-        ))
-    }
-    #[cfg(unix)]
     fn persist(&self, subs: &[Subscription]) -> io::Result<()> {
-        let tmp = self
-            .state
-            .with_file_name(format!(".events-{}", Uuid::new_v4()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            serde_json::to_writer(&mut file, subs).map_err(io::Error::other)?;
-            file.flush()?;
-            file.sync_all()?;
-            fs::rename(&tmp, &self.state)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(tmp);
-        }
-        result
+        self.state.replace_subscriptions(|file| {
+            serde_json::to_writer(file, subs).map_err(io::Error::other)
+        })
     }
     pub fn cleanup(&self) -> io::Result<()> {
         let mut lock = self
