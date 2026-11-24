@@ -10,6 +10,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex, Weak},
     thread,
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -262,9 +263,28 @@ fn run_acp(job: AcpJob) {
                             events.complete(&session_id, &turn_id, &event_reason)
                         });
                     }
-                    turn = match receiver.recv() {
-                        Ok(turn) => turn,
-                        Err(_) => return Ok(()),
+                    turn = loop {
+                        match receiver.recv_timeout(Duration::from_millis(100)) {
+                            Ok(turn) => break turn,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        let alive = matches!(child.0.lock().unwrap().try_wait(), Ok(None));
+                        if alive {
+                            continue;
+                        }
+                        let records = sessions.lock().unwrap();
+                        // A follow-up reserves the running turn before queuing it.
+                        if records
+                            .get(&id)
+                            .is_some_and(|record| record["status"] == "running")
+                        {
+                            continue;
+                        }
+                        if let Some(workers) = workers.upgrade() {
+                            workers.lock().unwrap().remove(&id);
+                        }
+                        return Ok(());
                     };
                     submitted = false;
                     if child.0.lock().unwrap().try_wait()?.is_some() {

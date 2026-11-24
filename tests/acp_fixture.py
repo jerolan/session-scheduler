@@ -16,6 +16,8 @@ for line in sys.stdin:
         if prompt == 'check_scheduler_environment' and any(key.startswith('SESSION_SCHEDULER_') or key in ('CONTROL_PLANE_API_KEY','OPENAI_ADMIN_KEY') for key in os.environ):
             print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32603,'message':'unexpected scheduler environment'}}), flush=True)
             continue
+        if prompt == 'complete_and_exit':
+            Path('fixture.pid').write_text(str(os.getpid()))
         if prompt == 'error':
             print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32603,'message':'fixture failure'}}), flush=True)
             continue
@@ -58,3 +60,5 @@ for line in sys.stdin:
         result = {'stopReason': prompt if prompt in ('cancelled','refusal','max_tokens','max_turn_requests','future_reason') else 'end_turn'}
     else: continue
     print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}), flush=True)
+    if method == 'session/prompt' and prompt == 'complete_and_exit':
+        break

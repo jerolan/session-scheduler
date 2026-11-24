@@ -1,4 +1,4 @@
-import json, os, subprocess, tempfile, time, unittest
+import json, os, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 BIN = str(Path(__file__).resolve().parents[1] / 'target/debug/session-scheduler')
@@ -68,6 +68,22 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(current['history'], [
             {'role':'user','text':'remember:blue'}, {'role':'agent','text':'remembered'},
             {'role':'user','text':'recall'}, {'role':'agent','text':'blue'}])
+
+    @unittest.skipUnless(sys.platform == 'linux', 'process reaping is observed through Linux procfs')
+    def test_reaps_agent_that_exits_after_completion(self):
+        completed = self.finish('complete_and_exit')
+        self.assertEqual((completed['status'], completed['stop_reason']), ('completed', 'end_turn'))
+        pid = int(Path(self.tmp.name, 'fixture.pid').read_text())
+        process = Path('/proc', str(pid))
+        deadline = time.monotonic() + 3
+        while process.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertFalse(process.exists(), 'exited ACP child was not reaped during idle time')
+
+        args = {'session_id':completed['session_id']}
+        self.assertTrue(self.call('follow_up', {**args, 'prompt':'recall'})['isError'])
+        current = json.loads(self.call('inspect_session', args)['content'][0]['text'])
+        self.assertEqual(current, completed)
 
     def test_follow_up_rejects_running_and_unusable_sessions(self):
         created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':'hello'})['content'][0]['text'])
