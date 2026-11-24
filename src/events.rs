@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     env,
     io::{self, Read},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::Mutex,
     time::Duration,
@@ -38,6 +38,7 @@ pub struct Events {
     account: String,
     state: crate::state_files::StateFiles,
     callback: Option<String>,
+    callback_host: Option<String>,
     ip: Option<IpAddr>,
     loopback: bool,
     subscriptions: Mutex<Vec<Subscription>>,
@@ -80,6 +81,37 @@ fn public_ip(ip: IpAddr) -> bool {
         }
     }
 }
+fn callback_url(raw: &str) -> Result<Url, ()> {
+    let url = Url::parse(raw).map_err(|_| ())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(());
+    }
+    Ok(url)
+}
+
+fn matches_callback_host(url: &Url, host: &str) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some(host)
+        && url.port_or_known_default() == Some(443)
+}
+
+fn public_callback_addresses(
+    addresses: impl Iterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, &'static str> {
+    let addresses: Vec<_> = addresses.collect();
+    if addresses.is_empty() {
+        return Err("transient");
+    }
+    if addresses.iter().any(|addr| !public_ip(addr.ip())) {
+        return Err("invalid_url");
+    }
+    Ok(addresses)
+}
+
 fn constant_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -127,10 +159,28 @@ impl Events {
             .transpose()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid callback IP"))?;
         let loopback = env::var("SESSION_SCHEDULER_TEST_LOOPBACK_CALLBACK").as_deref() == Ok("1");
+        let callback_host = match env::var("SESSION_SCHEDULER_CALLBACK_HOST") {
+            Ok(host)
+                if matches!(url::Host::parse(&host), Ok(url::Host::Domain(domain)) if domain == host)
+                    && callback.is_none()
+                    && ip.is_none()
+                    && !loopback =>
+            {
+                Some(host)
+            }
+            Err(env::VarError::NotPresent) => None,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "callback host must be a domain and cannot be combined with a fixed callback",
+                ));
+            }
+        };
         let service = Self {
             account,
             state,
             callback,
+            callback_host,
             ip,
             loopback,
             subscriptions: Mutex::new(subscriptions),
@@ -146,16 +196,14 @@ impl Events {
         service.cleanup()?;
         Ok(service)
     }
-    fn target(&self, raw: &str) -> Result<(Url, IpAddr), ()> {
-        if self.callback.as_deref() != Some(raw) {
-            return Err(());
+    fn target(&self, raw: &str) -> Result<(Url, Option<IpAddr>), ()> {
+        let url = callback_url(raw)?;
+        if let Some(host) = &self.callback_host {
+            return matches_callback_host(&url, host)
+                .then_some((url, None))
+                .ok_or(());
         }
-        let url = Url::parse(raw).map_err(|_| ())?;
-        if !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-            || url.host_str().is_none()
-        {
+        if self.callback.as_deref() != Some(raw) {
             return Err(());
         }
         if self.loopback
@@ -163,7 +211,7 @@ impl Events {
             && url.host_str() == Some("127.0.0.1")
             && url.port().is_some()
         {
-            return Ok((url, IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            return Ok((url, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
         }
         let ip = self.ip.ok_or(())?;
         if url.scheme() != "https"
@@ -172,7 +220,7 @@ impl Events {
         {
             return Err(());
         }
-        Ok((url, ip))
+        Ok((url, Some(ip)))
     }
     fn persist(&self, subs: &[Subscription]) -> io::Result<()> {
         self.state.replace_subscriptions(|file| {
@@ -211,11 +259,17 @@ impl Events {
         let (url, ip) = self.target(&sub.url).map_err(|_| "invalid_url")?;
         let host = url.host_str().ok_or("invalid_url")?;
         let port = url.port_or_known_default().ok_or("invalid_url")?;
+        let addresses = match ip {
+            Some(ip) => vec![SocketAddr::new(ip, port)],
+            None => {
+                public_callback_addresses((host, port).to_socket_addrs().map_err(|_| "transient")?)?
+            }
+        };
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
-            .resolve(host, SocketAddr::new(ip, port))
+            .resolve_to_addrs(host, &addresses)
             .build()
             .map_err(|_| "invalid_url")?;
         let body = serde_json::to_vec(body).map_err(|_| "challenge_failed")?;
@@ -458,6 +512,70 @@ impl Events {
                     _ => break,
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_callback_host_allows_subscription_paths_on_https() {
+        let host = "receiver.example.com";
+        for raw in [
+            "https://receiver.example.com/events/first",
+            "https://receiver.example.com:443/events/second?delivery=webhook",
+        ] {
+            let url = callback_url(raw).unwrap();
+            assert!(matches_callback_host(&url, host), "{raw}");
+        }
+
+        for raw in [
+            "http://receiver.example.com/events",
+            "https://receiver.example.com:8443/events",
+            "https://nested.receiver.example.com/events",
+            "https://receiver.example.com.example.org/events",
+            "https://receiver.example.com./events",
+            "https://user:password@receiver.example.com/events",
+            "https://receiver.example.com/events#fragment",
+            "https://127.0.0.1/events",
+        ] {
+            assert!(
+                !callback_url(raw).is_ok_and(|url| matches_callback_host(&url, host)),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_dns_rejects_mixed_public_and_nonpublic_answers() {
+        let v4 = "8.8.8.8:443".parse().unwrap();
+        let v6 = "[2606:4700:4700::1111]:443".parse().unwrap();
+        assert_eq!(
+            public_callback_addresses([v4, v6].into_iter()),
+            Ok(vec![v4, v6])
+        );
+        assert_eq!(
+            public_callback_addresses(std::iter::empty()),
+            Err("transient")
+        );
+        for raw in [
+            "127.0.0.1:443",
+            "192.168.0.1:443",
+            "169.254.169.254:443",
+            "100.64.0.1:443",
+            "[::1]:443",
+            "[::ffff:10.0.0.1]:443",
+            "[fd00::1]:443",
+            "[2001:db8::1]:443",
+        ] {
+            let nonpublic = raw.parse().unwrap();
+            assert_eq!(
+                public_callback_addresses([v4, nonpublic].into_iter()),
+                Err("invalid_url"),
+                "{raw}"
+            );
         }
     }
 }
