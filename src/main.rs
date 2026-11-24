@@ -45,9 +45,11 @@ fn run_acp(
     let run = || -> io::Result<()> {
         let mut agent_command = Command::new(command);
         for (key, _) in env::vars_os() {
-            if key.to_string_lossy().starts_with("SESSION_SCHEDULER_")
-                || key == "CONTROL_PLANE_API_KEY"
-                || key == "OPENAI_ADMIN_KEY"
+            // Windows environment keys are case-insensitive.
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            if name.starts_with("SESSION_SCHEDULER_")
+                || name.starts_with("CONTROL_PLANE_")
+                || name == "OPENAI_ADMIN_KEY"
             {
                 agent_command.env_remove(key);
             }

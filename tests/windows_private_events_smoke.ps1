@@ -1,6 +1,6 @@
 # Run with PowerShell 7 on Windows against cross-compiled Windows binaries:
 # pwsh -File tests/windows_private_events_smoke.ps1 -SchedulerExe <path> -FixtureExe <path>
-# Fixture build: rustc --target x86_64-pc-windows-gnu tests/acp_fixture_windows.rs -o acp-fixture.exe
+# Compile tests/acp_fixture_windows.rs as a standalone executable with the same Windows target and linker.
 param([Parameter(Mandatory)][string]$SchedulerExe, [Parameter(Mandatory)][string]$FixtureExe)
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'Run this smoke test on Windows.' }
@@ -94,11 +94,11 @@ $receiver = Start-Job -ArgumentList $receiverPort,([Convert]::ToBase64String($ke
     } finally { $listener.Stop() }
 }
 $callback = "http://127.0.0.1:$receiverPort/callback"
-$names = 'SESSION_SCHEDULER_HTTP_PORT','SESSION_SCHEDULER_BEARER_TOKEN','SESSION_SCHEDULER_ACCOUNT','SESSION_SCHEDULER_STATE_DIR','SESSION_SCHEDULER_CALLBACK_URL','SESSION_SCHEDULER_CALLBACK_IP','SESSION_SCHEDULER_TEST_LOOPBACK_CALLBACK','SESSION_SCHEDULER_WORKSPACES','SESSION_SCHEDULER_ACP_COMMAND','CONTROL_PLANE_API_KEY','OPENAI_ADMIN_KEY'
+$names = 'SESSION_SCHEDULER_HTTP_PORT','SESSION_SCHEDULER_BEARER_TOKEN','SESSION_SCHEDULER_ACCOUNT','SESSION_SCHEDULER_STATE_DIR','SESSION_SCHEDULER_CALLBACK_URL','SESSION_SCHEDULER_CALLBACK_IP','SESSION_SCHEDULER_TEST_LOOPBACK_CALLBACK','SESSION_SCHEDULER_WORKSPACES','SESSION_SCHEDULER_ACP_COMMAND','cOnTrOl_PlAnE_ApI_KeY','OPENAI_ADMIN_KEY','sEsSiOn_ScHeDuLeR_SMOKE_SECRET'
 $old = @{}; foreach ($name in $names) { $old[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $process = $null
 try {
-    $values = @($port, 'test-token', 'test-account', $state, $callback, '127.0.0.1', '1', $workspace, $FixtureExe, 'hidden', 'hidden')
+    $values = @($port, 'test-token', 'test-account', $state, $callback, '127.0.0.1', '1', $workspace, $FixtureExe, 'hidden', 'hidden', 'hidden')
     for ($i = 0; $i -lt $names.Count; $i++) { [Environment]::SetEnvironmentVariable($names[$i], "$($values[$i])", 'Process') }
     $ready = $false
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
@@ -110,6 +110,10 @@ try {
     Start-Scheduler
     $initial = Rpc 'initialize' @{protocolVersion='2025-03-26'; capabilities=@{}; clientInfo=@{name='windows-smoke';version='1'}}
     Assert ($null -ne $initial.result.capabilities.events) 'Events capability missing'
+    $catalog = Rpc 'events/list' @{}
+    Assert ($catalog.result.events[0].name -eq 'turn.completed') 'Completion event is missing from discovery'
+    $unauthorized = Invoke-WebRequest -Uri "http://127.0.0.1:$port/mcp" -Method Post -ContentType 'application/json' -Body '{}' -SkipHttpErrorCheck -TimeoutSec 5
+    Assert ($unauthorized.StatusCode -eq 401) 'Unauthenticated access was not rejected'
     $subscription = @{name='turn.completed'; arguments=@{}; delivery=@{mode='webhook';url=$callback;secret=('whsec_' + [Convert]::ToBase64String($key))}}
     $response = Rpc 'events/subscribe' $subscription
     Assert ($null -eq $response.error -and $response.result.id) "Subscribe failed: $($response | ConvertTo-Json -Depth 10 -Compress)"
@@ -125,12 +129,11 @@ try {
         $message = Next-Message; $event = $message.body | ConvertFrom-Json
         Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.eventId -and $event.data.session_id -eq $ids.session_id -and $event.data.turn_id -eq $ids.turn_id -and $event.data.reason -eq $reason) "Completion mismatch: $($message.body)"
     }
-    Check-Turn 'success' 'end_turn'
+    Check-Turn 'permission' 'end_turn'
     Check-Turn 'error' 'failed'
     Stop-Scheduler
     Start-Scheduler
-    $again = Rpc 'events/subscribe' $subscription
-    Assert ($again.result.id -eq $id) 'Subscription did not persist across restart'
+    # The original subscription must deliver before any attempt to subscribe again.
     Check-Turn 'error' 'failed'
     $unsubscribed = Rpc 'events/unsubscribe' @{name='turn.completed';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Assert ($null -eq $unsubscribed.error) 'Unsubscribe did not atomically replace subscriptions'
@@ -159,7 +162,7 @@ try {
     }
     Write-Host 'PASS: Windows authenticated MCP and signed verification'
     Write-Host 'PASS: signed success and confirmed-failure events matched session and turn IDs'
-    Write-Host 'PASS: persisted subscription, atomic replacement, private ACLs and read-only fixture'
+    Write-Host 'PASS: persisted subscription, atomic replacement, protected ACLs and denied ACP approval'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {
     Stop-Scheduler
