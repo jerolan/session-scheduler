@@ -18,13 +18,34 @@ use url::Url;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
-const NAME: &str = "turn.completed";
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub(super) enum TurnEvent {
+    #[default]
+    Completed,
+    RecoveryRequired,
+}
+
+impl TurnEvent {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Completed => "turn.completed",
+            Self::RecoveryRequired => "turn.recovery_required",
+        }
+    }
+
+    fn catalog_entry(self, description: &str) -> Value {
+        json!({"name":self.name(),"description":description,"delivery":["webhook"],"inputSchema":{"type":"object","properties":{},"additionalProperties":false},"payloadSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"},"reason":{"type":"string"}},"required":["session_id","turn_id","reason"],"additionalProperties":false}})
+    }
+}
+
 const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const ROTATION_SECONDS: i64 = 300;
 const VERIFICATION_SECONDS: i64 = 3600;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Subscription {
+    #[serde(default)]
+    event: TurnEvent,
     id: String,
     account: String,
     url: String,
@@ -38,6 +59,8 @@ struct Subscription {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingEvent {
+    #[serde(default)]
+    event: TurnEvent,
     subscription_id: String,
     event_id: String,
     timestamp: String,
@@ -50,7 +73,7 @@ impl PendingEvent {
     fn body(&self) -> Value {
         json!({
             "eventId": self.event_id,
-            "name": NAME,
+            "name": self.event.name(),
             "timestamp": self.timestamp,
             "data": {
                 "session_id": self.session_id,
@@ -289,9 +312,9 @@ impl Events {
         }
         Ok(())
     }
-    fn id(&self, url: &str) -> String {
+    fn id(&self, url: &str, event: TurnEvent) -> String {
         let mut h = Sha256::new();
-        for part in [&self.account[..], url, NAME, "{}"] {
+        for part in [&self.account[..], url, event.name(), "{}"] {
             h.update((part.len() as u64).to_be_bytes());
             h.update(part.as_bytes());
         }
@@ -374,16 +397,21 @@ impl Events {
     }
     pub fn dispatch(&self, method: &str, params: &Value) -> Option<Result<Value, Value>> {
         match method {
-            "events/list" => Some(Ok(
-                json!({"events":[{"name":NAME,"description":"A delegated turn reached a confirmed terminal outcome.","delivery":["webhook"],"inputSchema":{"type":"object","properties":{},"additionalProperties":false},"payloadSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"},"reason":{"type":"string"}},"required":["session_id","turn_id","reason"],"additionalProperties":false}}]}),
-            )),
+            "events/list" => Some(Ok(json!({"events":[
+                TurnEvent::Completed.catalog_entry("A delegated turn reached a confirmed terminal outcome."),
+                TurnEvent::RecoveryRequired.catalog_entry("A delegated turn still has an unknown outcome after automatic recovery."),
+            ]}))),
             "events/subscribe" | "events/unsubscribe" => Some(self.change(method, params)),
             _ => None,
         }
     }
     fn change(&self, method: &str, p: &Value) -> Result<Value, Value> {
-        if p.get("name").and_then(Value::as_str) != Some(NAME)
-            || p.get("arguments") != Some(&json!({}))
+        let event = match p.get("name").and_then(Value::as_str) {
+            Some("turn.completed") => TurnEvent::Completed,
+            Some("turn.recovery_required") => TurnEvent::RecoveryRequired,
+            _ => return Err(invalid()),
+        };
+        if p.get("arguments") != Some(&json!({}))
             || p.pointer("/delivery/mode").and_then(Value::as_str) != Some("webhook")
         {
             return Err(invalid());
@@ -396,7 +424,7 @@ impl Events {
             .map_err(|_| callback_error("invalid_url"))?;
         self.cleanup()
             .map_err(|_| json!({"code":-32603,"message":"Internal error"}))?;
-        let id = self.id(url);
+        let id = self.id(url, event);
         if method == "events/unsubscribe" {
             let mut lock = self.subscriptions.lock().map_err(|_| invalid())?;
             let mut next = lock.clone();
@@ -424,6 +452,7 @@ impl Events {
         };
         let expires = Utc::now() + ChronoDuration::milliseconds(ttl);
         let mut sub = Subscription {
+            event,
             id: id.clone(),
             account: self.account.clone(),
             url: url.to_owned(),
@@ -495,8 +524,9 @@ impl Events {
             json!({"id":id,"refreshBefore":expires.to_rfc3339_opts(chrono::SecondsFormat::AutoSi,true),"cursor":null,"truncated":false}),
         )
     }
-    pub fn complete(
+    pub fn queue_turn_event(
         &self,
+        event: TurnEvent,
         session_id: &str,
         turn_id: &str,
         reason: &str,
@@ -513,18 +543,21 @@ impl Events {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             || !matches!(
-                reason,
-                "end_turn"
-                    | "refusal"
-                    | "max_tokens"
-                    | "max_turn_requests"
-                    | "failed"
-                    | "cancelled"
+                (event, reason),
+                (
+                    TurnEvent::Completed,
+                    "end_turn"
+                        | "refusal"
+                        | "max_tokens"
+                        | "max_turn_requests"
+                        | "failed"
+                        | "cancelled"
+                ) | (TurnEvent::RecoveryRequired, "outcome_unknown")
             )
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid turn completion",
+                "invalid turn event",
             ));
         }
 
@@ -535,8 +568,9 @@ impl Events {
         let now = Utc::now();
         let events = subscriptions
             .iter()
-            .filter(|sub| sub.expires > now)
+            .filter(|sub| sub.event == event && sub.expires > now)
             .map(|sub| PendingEvent {
+                event,
                 subscription_id: sub.id.clone(),
                 event_id: format!("evt_{}", Uuid::new_v4()),
                 timestamp: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

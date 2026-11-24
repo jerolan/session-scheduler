@@ -41,6 +41,29 @@ Cuando el turno alcance un desenlace confirmado, llama a `archive_session`
 con el `session_id`. La sesión sale de `list_sessions` y sigue disponible
 en `inspect_session` con `archived: true`, su historial y su desenlace.
 
+## Recuperación de un turno interrumpido
+
+Si se pierde la respuesta del turno, el scheduler intenta cargar la sesión
+ACP existente hasta tres veces, con hasta dos segundos para inicializar y cargar la sesión en cada intento.
+Durante los intentos, `inspect_session` muestra `recovering` y conserva los
+IDs y el historial ya observado. Si el desenlace sigue sin confirmarse, el
+estado pasa a `unknown` y se registra `turn.recovery_required` con motivo
+`outcome_unknown`. En HTTP, este evento tiene su propia suscripción y usa
+la misma cola persistente que `turn.completed`.
+
+Llama a `reconnect_session` con `session_id` para hacer un intento adicional.
+Si el adaptador confirma el desenlace, `turn.completed` lleva los IDs del
+turno original. Después se puede enviar un encargo explícito con `follow_up`
+en la sesión recuperada. Los intentos de recuperación solo inicializan el
+adaptador y solicitan la carga de la sesión existente.
+
+ACP estándar puede recargar la conversación. Para confirmar el desenlace,
+el scheduler requiere que la respuesta de `session/load` incluya
+`_meta["session-scheduler/turnOutcome"]` con `sessionId`, `promptRequestId`
+(el ID JSON-RPC original de `session/prompt`) y un `stopReason` terminal
+reconocido. El fixture implementa esta evidencia. Un adaptador que solo
+devuelve la recarga estándar deja el desenlace indeterminado.
+
 ## Registro local en Codex Desktop
 
 En Windows, usa el arranque de desarrollo existente. El scheduler escucha por

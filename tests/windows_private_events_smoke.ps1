@@ -204,6 +204,26 @@ try {
     Assert ($after.result -ceq 'blue plum') 'Follow-up did not recall the first turn'
     Assert (($after.history.text -join '|') -ceq 'Remember blue plum|Remembered.|What did I ask you to remember?|blue plum') 'Follow-up did not preserve the first turn in history'
     $null = Check-Turn 'error' 'failed'
+    $recoverySubscription = Rpc 'events/subscribe' @{name='turn.recovery_required';arguments=@{};delivery=$subscription.delivery}
+    $noticeSubscriptionId = $recoverySubscription.result.id
+    Assert ($noticeSubscriptionId -and $noticeSubscriptionId -ne $id) 'Recovery event subscription failed'
+    $verification = Next-Message
+    Assert ($verification.subscription -eq $noticeSubscriptionId) 'Recovery challenge subscription ID mismatch'
+    $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt='disconnect with pong'}}
+    Assert (-not $delegation.result.isError) 'Interrupted turn was rejected'
+    $interrupted = $delegation.result.content[0].text | ConvertFrom-Json
+    $message = Next-Message; $notice = $message.body | ConvertFrom-Json
+    Assert ($message.subscription -eq $noticeSubscriptionId -and $notice.name -eq 'turn.recovery_required' -and $notice.data.session_id -eq $interrupted.session_id -and $notice.data.turn_id -eq $interrupted.turn_id) 'Recovery notice IDs did not match'
+    $unresolved = Inspect $interrupted.session_id
+    Assert ($unresolved.status -eq 'unknown' -and $null -eq $unresolved.stop_reason -and $unresolved.result -ceq 'pong') 'Last known state was lost'
+    New-Item -ItemType File -Path (Join-Path $workspace 'outcome-ready') | Out-Null
+    $reconnection = Rpc 'tools/call' @{name='reconnect_session';arguments=@{session_id=$interrupted.session_id}}
+    Assert (-not $reconnection.result.isError) 'Explicit reconnection was rejected'
+    $message = Next-Message; $completion = $message.body | ConvertFrom-Json
+    Assert ($message.subscription -eq $id -and $completion.name -eq 'turn.completed' -and $completion.eventId -ne $notice.eventId -and $completion.data.session_id -eq $interrupted.session_id -and $completion.data.turn_id -eq $interrupted.turn_id -and $completion.data.reason -eq 'end_turn') 'Recovered completion IDs did not match'
+    $restored = Inspect $interrupted.session_id
+    Assert ($restored.status -eq 'completed' -and $restored.acp_session_id -eq $unresolved.acp_session_id -and ($restored.history.text -join '|') -ceq 'disconnect with pong|pong') 'Recovery did not preserve the ACP session and history'
+    $null = Rpc 'events/unsubscribe' @{name='turn.recovery_required';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Stop-Scheduler
     Start-Scheduler
     # The original subscription must deliver before any attempt to subscribe again.
@@ -236,6 +256,7 @@ try {
     Write-Host 'PASS: Windows authenticated MCP and signed verification'
     Write-Host 'PASS: signed success and confirmed-failure events matched session and turn IDs'
     Write-Host 'PASS: explicit follow-up kept ACP session and context with distinct signed completions'
+    Write-Host 'PASS: recovery notice and explicit reconnection confirmed the original turn'
     Write-Host 'PASS: persisted subscription, atomic replacement, protected ACLs and denied ACP approval'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {

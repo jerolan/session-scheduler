@@ -1,16 +1,18 @@
+mod acp;
 mod events;
 mod http;
 mod state_files;
+use acp::{AcpJob, Start};
+use events::TurnEvent;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::{mpsc, Arc, Mutex, Weak},
+    process::{Child, ChildStdin},
+    sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
 };
 use uuid::Uuid;
 
@@ -20,14 +22,6 @@ struct ChildRegistry {
     children: BTreeMap<String, Arc<Mutex<Child>>>,
 }
 type Children = Arc<Mutex<ChildRegistry>>;
-struct Agent(Arc<Mutex<Child>>);
-impl Drop for Agent {
-    fn drop(&mut self) {
-        let mut child = self.0.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
 #[derive(Clone, Copy)]
 enum AgentKind {
     Codex,
@@ -162,8 +156,36 @@ fn finish_turn(
         }
     };
     if let Some(events) = events {
-        if let Err(error) = events.complete(id, turn_id, event_reason, publish) {
+        if let Err(error) =
+            events.queue_turn_event(TurnEvent::Completed, id, turn_id, event_reason, publish)
+        {
             eprintln!("could not persist completion of turn {turn_id}: {error}");
+        }
+    } else {
+        publish();
+    }
+}
+
+fn require_recovery(sessions: &Sessions, events: Option<&events::Events>, id: &str, turn_id: &str) {
+    let publish = {
+        let (sessions, id, turn_id) = (sessions.clone(), id.to_owned(), turn_id.to_owned());
+        move || {
+            update(&sessions, &id, |record| {
+                if record["turn_id"] == turn_id && record["status"] == "recovering" {
+                    record["status"] = json!("unknown");
+                }
+            })
+        }
+    };
+    if let Some(events) = events {
+        if let Err(error) = events.queue_turn_event(
+            TurnEvent::RecoveryRequired,
+            id,
+            turn_id,
+            "outcome_unknown",
+            publish,
+        ) {
+            eprintln!("could not persist recovery notice for turn {turn_id}: {error}");
         }
     } else {
         publish();
@@ -173,281 +195,6 @@ fn finish_turn(
 fn send(writer: &mut impl Write, value: Value) -> io::Result<()> {
     writeln!(writer, "{value}")?;
     writer.flush()
-}
-struct AcpJob {
-    sessions: Sessions,
-    id: String,
-    workspace: PathBuf,
-    first: Turn,
-    receiver: mpsc::Receiver<Turn>,
-    workers: Weak<Mutex<BTreeMap<String, mpsc::Sender<Turn>>>>,
-    children: Weak<Mutex<ChildRegistry>>,
-    adapter: Adapter,
-    events: Option<Arc<events::Events>>,
-    cancel_writers: CancelWriters,
-}
-
-fn run_acp(job: AcpJob) {
-    let AcpJob {
-        sessions,
-        id,
-        workspace,
-        first,
-        receiver,
-        workers,
-        children,
-        adapter,
-        events,
-        cancel_writers,
-    } = job;
-    let cancel_slot = cancel_writers.lock().unwrap().get(&id).unwrap().clone();
-    let mut submitted = false;
-    let mut turn = first;
-    let run = || -> io::Result<()> {
-        let mut agent_command = Command::new(adapter.executable);
-        match adapter.kind {
-            AgentKind::Codex => agent_command.env("INITIAL_AGENT_MODE", "read-only"),
-            AgentKind::OpenCode => agent_command.arg("acp"),
-        };
-        for (key, _) in env::vars_os() {
-            // Windows environment keys are case-insensitive.
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            if name.starts_with("SESSION_SCHEDULER_")
-                || name.starts_with("CONTROL_PLANE_")
-                || name == "OPENAI_ADMIN_KEY"
-            {
-                agent_command.env_remove(key);
-            }
-        }
-        let registry = children
-            .upgrade()
-            .ok_or_else(|| io::Error::other("scheduler stopped"))?;
-        let mut registry = registry.lock().unwrap();
-        if registry.stopping {
-            return Err(io::Error::other("scheduler stopped"));
-        }
-        let child = Agent(Arc::new(Mutex::new(
-            agent_command
-                .current_dir(&workspace)
-                .env_remove("CODEX_CONFIG")
-                .env_remove("APP_SERVER_LOGS")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?,
-        )));
-        registry.children.insert(id.clone(), child.0.clone());
-        drop(registry);
-        let input = child
-            .0
-            .lock()
-            .unwrap()
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("missing stdin"))?;
-        let input = Arc::new(Mutex::new(input));
-        let output = child
-            .0
-            .lock()
-            .unwrap()
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("missing stdout"))?;
-        send(
-            &mut *input.lock().unwrap(),
-            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"session-scheduler","version":"0.1.0"}}}),
-        )?;
-        let mut phase = 1;
-        let mut request_id = 1;
-        let mut acp_session_id: Option<String> = None;
-        for line in BufReader::new(output).lines() {
-            let line = line?;
-            let message: Value = serde_json::from_str(&line).map_err(io::Error::other)?;
-            if let Some(method) = message.get("method").and_then(Value::as_str) {
-                if method == "session/request_permission" {
-                    if let Some(request_id) = message.get("id") {
-                        send(
-                            &mut *input.lock().unwrap(),
-                            json!({"jsonrpc":"2.0","id":request_id,"result":{"outcome":{"outcome":"cancelled"}}}),
-                        )?;
-                    }
-                } else if method == "session/update" {
-                    if message["params"]["sessionId"].as_str() != acp_session_id.as_deref()
-                        || acp_session_id.is_none()
-                    {
-                        continue;
-                    }
-                    let u = &message["params"]["update"];
-                    if u["sessionUpdate"] == "agent_message_chunk" && u["content"]["type"] == "text"
-                    {
-                        if let Some(text) = u["content"]["text"].as_str() {
-                            update(&sessions, &id, |s| {
-                                let old = s["result"].as_str().unwrap_or("");
-                                s["result"] = json!(format!("{old}{text}"));
-                                let history = s["history"].as_array_mut().unwrap();
-                                if let Some(last) =
-                                    history.last_mut().filter(|entry| entry["role"] == "agent")
-                                {
-                                    let old = last["text"].as_str().unwrap_or("");
-                                    last["text"] = json!(format!("{old}{text}"));
-                                } else {
-                                    history.push(json!({"role":"agent", "text":text}));
-                                }
-                            });
-                        }
-                    } else if matches!(
-                        u["sessionUpdate"].as_str(),
-                        Some("tool_call" | "tool_call_update")
-                    ) {
-                        if let (Some(tool_id), Some(status)) =
-                            (u["toolCallId"].as_str(), u["status"].as_str())
-                        {
-                            if matches!(status, "pending" | "in_progress" | "completed" | "failed")
-                            {
-                                update(&sessions, &id, |s| {
-                                    s["history"].as_array_mut().unwrap().push(json!({"type":"tool_call", "tool_call_id":tool_id, "status":status}))
-                                });
-                            }
-                        }
-                    }
-                } else if let Some(request_id) = message.get("id") {
-                    send(
-                        &mut *input.lock().unwrap(),
-                        json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Method not supported"}}),
-                    )?;
-                }
-                continue;
-            }
-            if message["id"].as_u64() != Some(request_id) {
-                continue;
-            }
-            if message.get("error").is_some() {
-                submitted = false; // A matching response confirms the request failed.
-                return Err(io::Error::other("ACP request failed"));
-            }
-            match phase {
-                1 => {
-                    send(
-                        &mut *input.lock().unwrap(),
-                        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":workspace,"mcpServers":[]}}),
-                    )?;
-                    phase = 2;
-                    request_id = 2;
-                }
-                2 => {
-                    let acp_id = message["result"]["sessionId"]
-                        .as_str()
-                        .ok_or_else(|| io::Error::other("missing ACP session"))?;
-                    update(&sessions, &id, |s| s["acp_session_id"] = json!(acp_id));
-                    acp_session_id = Some(acp_id.to_owned());
-                    // The running turn is already visible before sending the prompt.
-                    submitted = true;
-                    send(
-                        &mut *input.lock().unwrap(),
-                        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":acp_id,"prompt":[{"type":"text","text":turn.prompt}]}}),
-                    )?;
-                    register_cancel(&cancel_slot, &sessions, &id, &turn.id, acp_id, &input);
-                    phase = 3;
-                    request_id = 3;
-                }
-                3 => {
-                    let reason = message["result"]["stopReason"]
-                        .as_str()
-                        .ok_or_else(|| io::Error::other("missing stop reason"))?;
-                    let status = match reason {
-                        "end_turn" => "completed",
-                        "cancelled" => "cancelled",
-                        _ => "failed",
-                    };
-                    let event_reason = match reason {
-                        "end_turn" | "cancelled" | "refusal" | "max_tokens"
-                        | "max_turn_requests" => reason,
-                        _ => "failed",
-                    };
-                    finish_turn(
-                        &sessions,
-                        events.as_deref(),
-                        &id,
-                        &turn.id,
-                        status,
-                        Some(reason),
-                        event_reason,
-                    );
-                    *cancel_slot.lock().unwrap() = None;
-                    turn = loop {
-                        match receiver.recv_timeout(Duration::from_millis(100)) {
-                            Ok(turn) => break turn,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        }
-                        let alive = matches!(child.0.lock().unwrap().try_wait(), Ok(None));
-                        if alive {
-                            continue;
-                        }
-                        let records = sessions.lock().unwrap();
-                        // A follow-up reserves the running turn before queuing it.
-                        if records.get(&id).is_some_and(|record| {
-                            matches!(record["status"].as_str(), Some("running" | "cancelling"))
-                        }) {
-                            continue;
-                        }
-                        if let Some(workers) = workers.upgrade() {
-                            workers.lock().unwrap().remove(&id);
-                        }
-                        return Ok(());
-                    };
-                    submitted = false;
-                    if child.0.lock().unwrap().try_wait()?.is_some() {
-                        return Err(io::Error::other("ACP process exited"));
-                    }
-                    submitted = true;
-                    request_id += 1;
-                    send(
-                        &mut *input.lock().unwrap(),
-                        json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":{"sessionId":acp_session_id,"prompt":[{"type":"text","text":turn.prompt}]}}),
-                    )?;
-                    register_cancel(
-                        &cancel_slot,
-                        &sessions,
-                        &id,
-                        &turn.id,
-                        acp_session_id.as_ref().unwrap(),
-                        &input,
-                    );
-                }
-                _ => unreachable!(),
-            }
-        }
-        Err(io::Error::other("ACP connection closed"))
-    };
-    let outcome = run();
-    if let Some(children) = children.upgrade() {
-        children.lock().unwrap().children.remove(&id);
-    }
-    cancel_writers.lock().unwrap().remove(&id);
-    if outcome.is_err() {
-        *cancel_slot.lock().unwrap() = None;
-        let mut records = sessions.lock().unwrap();
-        if let Some(workers) = workers.upgrade() {
-            workers.lock().unwrap().remove(&id);
-        }
-        if submitted {
-            if let Some(record) = records.get_mut(&id) {
-                record["status"] = json!("unknown");
-            }
-        } else {
-            drop(records);
-            finish_turn(
-                &sessions,
-                events.as_deref(),
-                &id,
-                &turn.id,
-                "failed",
-                None,
-                "failed",
-            );
-        }
-    }
 }
 struct Launch {
     action: Option<Action>,
@@ -461,7 +208,7 @@ struct Launch {
 enum Action {
     Start {
         workspace: PathBuf,
-        turn: Turn,
+        start: Start,
         receiver: mpsc::Receiver<Turn>,
         workers: Workers,
         children: Children,
@@ -479,10 +226,10 @@ impl Drop for Launch {
                         *record = previous;
                     } else {
                         sessions.remove(&self.id);
-                        if let Some(Action::Start { workers, .. }) = &self.action {
-                            workers.lock().unwrap().remove(&self.id);
-                            self.cancel_writers.lock().unwrap().remove(&self.id);
-                        }
+                    }
+                    if let Some(Action::Start { workers, .. }) = &self.action {
+                        workers.lock().unwrap().remove(&self.id);
+                        self.cancel_writers.lock().unwrap().remove(&self.id);
                     }
                 }
             }
@@ -493,7 +240,7 @@ fn launch(mut job: Launch) {
     match job.action.take().unwrap() {
         Action::Start {
             workspace,
-            turn,
+            start,
             receiver,
             workers,
             children,
@@ -503,7 +250,6 @@ fn launch(mut job: Launch) {
                 sessions: job.sessions.clone(),
                 id: job.id.clone(),
                 workspace,
-                first: turn,
                 receiver,
                 workers: Arc::downgrade(&workers),
                 children: Arc::downgrade(&children),
@@ -511,7 +257,7 @@ fn launch(mut job: Launch) {
                 events: job.events.clone(),
                 cancel_writers: job.cancel_writers.clone(),
             };
-            thread::spawn(move || run_acp(acp));
+            thread::spawn(move || acp.run(start));
         }
         Action::Follow(sender, turn) => {
             if sender.send(turn).is_err() {
@@ -608,10 +354,10 @@ impl State {
         let job = Launch {
             action: Some(Action::Start {
                 workspace,
-                turn: Turn {
+                start: Start::New(Turn {
                     id: tid.clone(),
                     prompt: prompt.to_owned(),
-                },
+                }),
                 receiver,
                 workers: self.workers.clone(),
                 children: self.children.clone(),
@@ -629,6 +375,81 @@ impl State {
             Some(job),
         )
     }
+    fn reconnect_session(&self, args: &Value) -> (Value, Option<Launch>) {
+        let Some(id) = args["session_id"].as_str() else {
+            return (result(json!("Session required"), true), None);
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(record) = sessions.get_mut(id) else {
+            return (result(json!("Session not found"), true), None);
+        };
+        if record["status"] != "unknown" || record["archived"] == true {
+            return (
+                result(json!("Session does not require recovery"), true),
+                None,
+            );
+        }
+        let Some(workspace) = record["workspace"]
+            .as_str()
+            .and_then(|p| PathBuf::from(p).canonicalize().ok())
+            .filter(|p| {
+                self.allowed.contains(p)
+                    && record["workspace"]
+                        .as_str()
+                        .is_some_and(|original| p == std::path::Path::new(original))
+            })
+        else {
+            return (result(json!("Workspace is not allowed"), true), None);
+        };
+        let (kind, executable) = match record["agent"].as_str() {
+            Some("codex") => (AgentKind::Codex, &self.codex_command),
+            Some("opencode") => (AgentKind::OpenCode, &self.opencode_command),
+            _ => return (result(json!("Unknown agent"), true), None),
+        };
+        let (Some(executable), Some(acp_id), Some(turn_id)) = (
+            executable.clone(),
+            record["acp_session_id"].as_str(),
+            record["turn_id"].as_str(),
+        ) else {
+            return (result(json!("Session is not available"), true), None);
+        };
+        let turn_id = turn_id.to_owned();
+        let start = Start::Reconnect {
+            acp_id: acp_id.to_owned(),
+            turn_id: turn_id.clone(),
+        };
+        let previous = record.clone();
+        record["status"] = json!("recovering");
+        let (sender, receiver) = mpsc::channel();
+        self.workers.lock().unwrap().insert(id.to_owned(), sender);
+        self.cancel_writers
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), Arc::new(Mutex::new(None)));
+        let job = Launch {
+            action: Some(Action::Start {
+                start,
+                workspace,
+                receiver,
+                workers: self.workers.clone(),
+                children: self.children.clone(),
+                adapter: Adapter { kind, executable },
+            }),
+            sessions: self.sessions.clone(),
+            id: id.to_owned(),
+            turn_id: turn_id.clone(),
+            previous: Some(previous),
+            events: self.events.clone(),
+            cancel_writers: self.cancel_writers.clone(),
+        };
+        (
+            result(
+                json!({"session_id":id,"turn_id":turn_id,"status":"recovering"}),
+                false,
+            ),
+            Some(job),
+        )
+    }
     fn follow_up(&self, args: &Value) -> (Value, Option<Launch>) {
         let (Some(id), Some(prompt)) = (
             args["session_id"].as_str(),
@@ -642,7 +463,7 @@ impl State {
         };
         if matches!(
             record["status"].as_str(),
-            Some("running" | "cancelling" | "completion_pending" | "unknown")
+            Some("running" | "cancelling" | "completion_pending" | "recovering" | "unknown")
         ) || record["archived"] == true
         {
             return (result(json!("Session is not available"), true), None);
@@ -788,7 +609,7 @@ impl State {
                         },
                         "required":["workspace","prompt"]
                     }
-                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
+                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover the existing session and check the original turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
             }
             "tools/call" => {
                 let args = &request["params"]["arguments"];
@@ -812,6 +633,11 @@ impl State {
                     },
                     "cancel_turn" => self.cancel_turn(args),
                     "archive_session" => self.archive_session(args),
+                    "reconnect_session" => {
+                        let (response, job) = self.reconnect_session(args);
+                        launch = job;
+                        response
+                    }
                     "follow_up" => {
                         let (response, job) = self.follow_up(args);
                         launch = job;

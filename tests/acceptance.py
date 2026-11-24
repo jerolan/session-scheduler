@@ -173,7 +173,7 @@ class Acceptance(unittest.TestCase):
         created = json.loads(response['content'][0]['text'])
         for _ in range(50):
             current = json.loads(self.call('inspect_session', {'session_id':created['session_id']})['content'][0]['text'])
-            if current['status'] != 'running': return current
+            if current['status'] not in ('running', 'recovering'): return current
             time.sleep(.1)
         self.fail('turn did not finish')
 
@@ -225,13 +225,39 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(current['status'], 'failed')
     def test_disconnected_turn_is_unknown_and_never_repeated(self):
         created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':'disconnect'})['content'][0]['text'])
-        for _ in range(50):
-            current = json.loads(self.call('inspect_session', {'session_id':created['session_id']})['content'][0]['text'])
-            if current['status'] != 'running': break
-            time.sleep(.1)
-        self.assertEqual(current['status'], 'unknown')
+        self.wait_for_status(created, 'unknown')
         time.sleep(.2)
         self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+    def test_recovers_original_turn_only_with_correlated_outcome(self):
+        args = {'workspace': self.tmp.name, 'prompt': 'recover_auto'}
+        ids = json.loads(self.call('delegate', args)['content'][0]['text'])
+        record = self.wait_for_status(ids, 'completed')
+        self.assertEqual(record['stop_reason'], 'end_turn')
+        self.assertEqual(record['history'], [
+            {'role': 'user', 'text': 'recover_auto'},
+            {'role': 'agent', 'text': 'pong'},
+        ])
+        self.assertEqual(json.loads(Path(self.tmp.name, 'interrupted.json').read_text())['loads'], 3)
+        self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+
+    def test_stalled_recovery_is_bounded_and_keeps_original_turn(self):
+        args = {'workspace': self.tmp.name, 'prompt': 'recover_stalled'}
+        ids = json.loads(self.call('delegate', args)['content'][0]['text'])
+        record = self.wait_for_status(ids, 'unknown')
+        self.assertIsNone(record['stop_reason'])
+        self.assertEqual(record['result'], 'pong')
+        self.assertEqual(json.loads(Path(self.tmp.name, 'interrupted.json').read_text())['loads'], 3)
+        self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+
+    def wait_for_status(self, ids, expected):
+        for _ in range(120):
+            record = json.loads(self.call('inspect_session', ids)['content'][0]['text'])
+            if record['status'] == expected:
+                self.assertEqual({key: record[key] for key in ids}, ids)
+                return record
+            time.sleep(.05)
+        self.fail(f'expected {expected}, got {record["status"]}')
+
     def test_rejects_workspace_outside_allowlist(self):
         result = self.call('delegate', {'workspace':'/', 'prompt':'hello'})
         self.assertTrue(result['isError'])

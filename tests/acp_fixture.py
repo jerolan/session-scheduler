@@ -2,14 +2,41 @@
 import json, sys, time, os, uuid
 from pathlib import Path
 session_id = str(uuid.uuid4())
+interrupted = Path('interrupted.json')
+
+def update(text):
+    print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':text}}}}), flush=True)
+
 memory = None
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
-    if method == 'initialize': result = {'protocolVersion':1,'agentCapabilities':{},'authMethods':[]}
+    if method == 'initialize': result = {'protocolVersion':1,'agentCapabilities':{'loadSession':True},'authMethods':[]}
     elif method == 'session/new':
         memory = None
         result = {'sessionId':session_id}
+    elif method == 'session/load':
+        if not interrupted.exists():
+            sys.exit(1)
+        previous = json.loads(interrupted.read_text())
+        if msg['params']['sessionId'] != previous['session'] or msg['params']['mcpServers']:
+            sys.exit(1)
+        session_id = previous['session']
+        memory = 'pong'
+        previous['loads'] += 1
+        interrupted.write_text(json.dumps(previous))
+        update('pong')
+        result = {}
+        if previous['mode'] == 'recover_auto':
+            session = 'wrong-session' if previous['loads'] == 1 else session_id
+            request = 'wrong-turn' if previous['loads'] == 2 else previous['request']
+            result['_meta'] = {'session-scheduler/turnOutcome': {
+                'sessionId': session, 'promptRequestId': request, 'stopReason': 'end_turn'}}
+        if previous['mode'] == 'recover_manual' and Path('outcome-ready').exists():
+            result['_meta'] = {'session-scheduler/turnOutcome': {
+                'sessionId': session_id, 'promptRequestId': previous['request'], 'stopReason': 'end_turn'}}
+        if previous['mode'] == 'recover_stalled' and previous['loads'] == 1:
+            time.sleep(30)
     elif method == 'session/prompt':
         if msg['params']['sessionId'] != session_id: sys.exit(1)
         prompt = msg['params']['prompt'][0]['text']
@@ -36,6 +63,16 @@ for line in sys.stdin:
         if prompt == 'error':
             print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32603,'message':'fixture failure'}}), flush=True)
             continue
+        if prompt.startswith('recover_'):
+            if interrupted.exists():
+                with Path('invocations').open('a') as counter:
+                    counter.write('x')
+                sys.exit(1)
+            Path('invocations').write_text('x')
+            interrupted.write_text(json.dumps({
+                'session': session_id, 'request': msg['id'], 'mode': prompt, 'loads': 0}))
+            update('pong')
+            sys.exit(0)
         if prompt == 'disconnect':
             counter = Path('invocations')
             counter.write_text(counter.read_text() + 'x' if counter.exists() else 'x')

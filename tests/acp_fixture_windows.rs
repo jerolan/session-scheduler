@@ -2,22 +2,36 @@
 use std::io::{self, BufRead, Write};
 fn main() {
     let mut lines = io::stdin().lock().lines();
-    let session_id = format!("fixture-{}", std::process::id());
+    let mut session_id = format!("fixture-{}", std::process::id());
     let mut remembered = false;
     while let Some(Ok(line)) = lines.next() {
         let response = if line.contains("\"initialize\"") {
-            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}"#
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}"#
         } else if line.contains("\"session/new\"") {
             remembered = false;
             println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{session_id}"}}}}"#);
+            io::stdout().flush().unwrap();
+            continue;
+        } else if line.contains("\"session/load\"") {
+            let saved = std::fs::read_to_string("interrupted.txt").unwrap();
+            let (session, original_request) = saved.split_once('\n').unwrap();
+            assert!(line.contains(&format!(r#""sessionId":"{session}""#)));
+            session_id = session.to_owned();
+            if std::path::Path::new("outcome-ready").exists() {
+                println!(
+                    r#"{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{"session-scheduler/turnOutcome":{{"sessionId":"{session}","promptRequestId":{original_request},"stopReason":"end_turn"}}}}}}}}"#
+                );
+            } else {
+                println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{}}}}"#);
+            }
             io::stdout().flush().unwrap();
             continue;
         } else if line.contains("\"session/prompt\"") {
             let id = line
                 .split_once(r#""id":"#)
                 .and_then(|(_, tail)| tail.split([',', '}']).next())
-                .and_then(|id| id.trim().parse::<u64>().ok())
-                .expect("numeric ACP request ID");
+                .map(str::trim)
+                .expect("ACP request ID");
             if !line.contains(&format!(r#""sessionId":"{session_id}""#)) {
                 std::process::exit(1);
             }
@@ -32,6 +46,19 @@ fn main() {
             {
                 r#""error":{"code":-32603,"message":"fixture failure"}"#
             } else {
+                if line.contains("\"disconnect with pong\"") {
+                    let mut saved = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open("interrupted.txt")
+                        .expect("original prompt submitted once");
+                    write!(saved, "{session_id}\n{id}").unwrap();
+                    println!(
+                        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{session_id}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"pong"}}}}}}}}"#
+                    );
+                    io::stdout().flush().unwrap();
+                    return;
+                }
                 if line.contains("\"permission\"") {
                     println!(
                         r#"{{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{{"sessionId":"{session_id}","toolCall":{{"toolCallId":"probe"}},"options":[{{"optionId":"allow","name":"Allow","kind":"allow_once"}}]}}}}"#

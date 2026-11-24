@@ -43,7 +43,11 @@ class HttpEvents(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.check_durable_completion(prompt, final_status, reason)
 
-    def check_durable_completion(self, prompt, final_status, reason):
+    def test_recovery_notice_survives_scheduler_restart(self):
+        self.check_durable_completion('recover_manual', 'unknown', 'outcome_unknown',
+                                      event_name='turn.recovery_required')
+
+    def check_durable_completion(self, prompt, final_status, reason, event_name='turn.completed'):
         with ExitStack() as cleanup:
             receiver = cleanup.enter_context(ThreadingHTTPServer(('127.0.0.1', 0), RecoveringReceiver))
             state = cleanup.enter_context(tempfile.TemporaryDirectory())
@@ -106,7 +110,7 @@ class HttpEvents(unittest.TestCase):
                 try:
                     wait_for_scheduler()
                     subscription = rpc('events/subscribe', {
-                        'name': 'turn.completed', 'arguments': {},
+                        'name': event_name, 'arguments': {},
                         'delivery': {'mode': 'webhook', 'url': callback, 'secret': SECRET},
                     })
                     # A directory at the destination makes the real atomic replacement fail.
@@ -125,7 +129,8 @@ class HttpEvents(unittest.TestCase):
                         self.assertEqual(call('cancel_turn', ids),
                                          (False, dict(ids, status='cancelling')))
                         (Path(state) / 'release-cancel').write_text('go')
-                    diagnostic = f'could not persist completion of turn {ids["turn_id"]}:'
+                    kind = 'completion of' if event_name == 'turn.completed' else 'recovery notice for'
+                    diagnostic = f'could not persist {kind} turn {ids["turn_id"]}:'
                     deadline = time.monotonic() + 5
                     while diagnostic not in log_path.read_text():
                         if time.monotonic() >= deadline:
@@ -135,7 +140,7 @@ class HttpEvents(unittest.TestCase):
                     error, record = call('inspect_session', session)
                     self.assertFalse(error)
                     self.assertEqual((record['status'], record['stop_reason']),
-                                     ('completion_pending', None))
+                                     ('completion_pending' if event_name == 'turn.completed' else 'recovering', None))
                     self.assertEqual(call('follow_up', dict(session, prompt='recall')),
                                      (True, 'Session is not available'))
                     self.assertEqual(call('archive_session', session),
@@ -148,23 +153,27 @@ class HttpEvents(unittest.TestCase):
                     error, record = call('inspect_session', session)
                     self.assertFalse(error)
                     self.assertEqual((record['status'], record['stop_reason']),
-                                     (final_status, reason))
+                                     (final_status, None if final_status == 'unknown' else reason))
                     self.assertEqual([entry['event_id'] for entry in json.loads(pending_path.read_text())],
                                      [event_id])
                     self.assertEqual(status, 503)
                     self.assertEqual(subscription_id, subscription['id'])
                     self.assertEqual(event['eventId'], event_id)
-                    self.assertEqual(event['name'], 'turn.completed')
+                    self.assertEqual(event['name'], event_name)
                     self.assertEqual(event['data'], {
                         'session_id': ids['session_id'], 'turn_id': ids['turn_id'], 'reason': reason,
                     })
-                    self.assertEqual(call('archive_session', session),
-                                     (False, dict(session, archived=True)))
-                    error, archived = call('inspect_session', session)
-                    self.assertFalse(error)
-                    self.assertTrue(archived['archived'])
-                    self.assertEqual((archived['status'], archived['stop_reason']),
-                                     (final_status, reason))
+                    if final_status == 'unknown':
+                        self.assertEqual(call('archive_session', session),
+                                         (True, 'Session cannot be archived'))
+                    else:
+                        self.assertEqual(call('archive_session', session),
+                                         (False, dict(session, archived=True)))
+                        error, archived = call('inspect_session', session)
+                        self.assertFalse(error)
+                        self.assertTrue(archived['archived'])
+                        self.assertEqual((archived['status'], archived['stop_reason']),
+                                         (final_status, reason))
                 finally:
                     scheduler.kill()
             # Any requests already accepted by the old process are excluded from replay.
@@ -205,7 +214,7 @@ class HttpEvents(unittest.TestCase):
                 status, data=post({'jsonrpc':'2.0','id':2,'method':'events/list','params':{}})
                 self.assertEqual(status, 200)
                 events=json.loads(data)['result']['events']
-                self.assertEqual([event['name'] for event in events], ['turn.completed'])
+                self.assertEqual([event['name'] for event in events], ['turn.completed', 'turn.recovery_required'])
                 self.assertEqual(events[0]['delivery'], ['webhook'])
                 self.assertEqual(set(events[0]['payloadSchema']['required']), {'session_id','turn_id','reason'})
                 self.assertEqual(post({'jsonrpc':'2.0','method':'notifications/initialized'})[0],202)
@@ -216,6 +225,124 @@ class HttpEvents(unittest.TestCase):
                 conn.request('GET','/mcp',headers=headers); r=conn.getresponse(); r.read(); self.assertEqual(r.status,405)
             finally:
                 p.kill(); p.wait(); conn.close()
+    def test_recovery_events_and_explicit_reconnection_correlate_with_original_turn(self):
+        with ExitStack() as cleanup:
+            receiver = cleanup.enter_context(ThreadingHTTPServer(('127.0.0.1', 0), Receiver))
+            receiver.messages = queue.Queue()
+            receiver.wrong = False
+            threading.Thread(target=receiver.serve_forever, daemon=True).start()
+            cleanup.callback(receiver.shutdown)
+            state = cleanup.enter_context(tempfile.TemporaryDirectory())
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                port = sock.getsockname()[1]
+            callback = f'http://127.0.0.1:{receiver.server_port}/callback'
+            env = dict(PATH=os.defpath, SESSION_SCHEDULER_HTTP_PORT=str(port),
+                       SESSION_SCHEDULER_BEARER_TOKEN='test-token',
+                       SESSION_SCHEDULER_ACCOUNT='test-account',
+                       SESSION_SCHEDULER_STATE_DIR=state,
+                       SESSION_SCHEDULER_CALLBACK_URL=callback,
+                       SESSION_SCHEDULER_TEST_LOOPBACK_CALLBACK='1',
+                       SESSION_SCHEDULER_WORKSPACES=state,
+                       SESSION_SCHEDULER_ACP_COMMAND=FIXTURE)
+            scheduler = cleanup.enter_context(subprocess.Popen([BIN], env=env))
+            cleanup.callback(scheduler.kill)
+
+            def rpc(method, params):
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
+                try:
+                    connection.request('POST', '/mcp', json.dumps({
+                        'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params,
+                    }), {'Authorization': 'Bearer test-token', 'Content-Type': 'application/json'})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    return json.loads(response.read())['result']
+                finally:
+                    connection.close()
+
+            def call(name, arguments):
+                response = rpc('tools/call', {'name': name, 'arguments': arguments})
+                return response['isError'], json.loads(response['content'][0]['text'])
+
+            subscriptions = {}
+
+            def expect_event(name, ids, reason):
+                event, signature, expected, subscription = receiver.messages.get(timeout=5)
+                self.assertEqual(signature, expected)
+                self.assertEqual(subscription, subscriptions[name])
+                self.assertEqual(event['name'], name)
+                self.assertEqual(event['data'], dict(ids, reason=reason))
+                self.assertTrue(event['eventId'])
+                return event['eventId']
+
+            for _ in range(100):
+                try:
+                    rpc('ping', {})
+                    break
+                except OSError:
+                    time.sleep(.05)
+            else:
+                self.fail('isolated scheduler did not start')
+
+            self.assertIn('reconnect_session', [tool['name'] for tool in rpc('tools/list', {})['tools']])
+            for name in ('turn.completed', 'turn.recovery_required'):
+                subscriptions[name] = rpc('events/subscribe', {
+                    'name': name, 'arguments': {},
+                    'delivery': {'mode': 'webhook', 'url': callback, 'secret': SECRET},
+                })['id']
+                challenge, signature, expected, subscription = receiver.messages.get(timeout=3)
+                self.assertEqual(challenge['type'], 'verification')
+                self.assertEqual(signature, expected)
+                self.assertEqual(subscription, subscriptions[name])
+            self.assertNotEqual(*subscriptions.values())
+
+            error, auto = call('delegate', {'workspace': state, 'prompt': 'recover_auto'})
+            self.assertFalse(error)
+            expect_event('turn.completed', auto, 'end_turn')
+            _, automatic = call('inspect_session', auto)
+            self.assertEqual((automatic['status'], automatic['result']), ('completed', 'pong'))
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+            self.assertFalse(call('archive_session', auto)[0])
+            Path(state, 'interrupted.json').unlink()
+
+            error, original = call('delegate', {'workspace': state, 'prompt': 'recover_manual'})
+            self.assertFalse(error)
+            notice = expect_event('turn.recovery_required', original, 'outcome_unknown')
+            _, unresolved = call('inspect_session', original)
+            self.assertEqual((unresolved['status'], unresolved['stop_reason']), ('unknown', None))
+            self.assertEqual(json.loads(Path(state, 'interrupted.json').read_text())['loads'], 3)
+            self.assertTrue(call('follow_up', dict(original, prompt='recall'))[0])
+
+            self.assertEqual(call('reconnect_session', original),
+                             (False, dict(original, status='recovering')))
+            for _ in range(100):
+                _, current = call('inspect_session', original)
+                if current['status'] == 'unknown':
+                    break
+                time.sleep(.05)
+            self.assertEqual(current, unresolved)
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=1.2)
+
+            Path(state, 'outcome-ready').touch()
+            self.assertEqual(call('reconnect_session', original),
+                             (False, dict(original, status='recovering')))
+            completed = expect_event('turn.completed', original, 'end_turn')
+            self.assertNotEqual(completed, notice)
+            _, resolved = call('inspect_session', original)
+            self.assertEqual(resolved, dict(unresolved, status='completed', stop_reason='end_turn'))
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+            self.assertTrue(call('reconnect_session', original)[0])
+            error, follow_up = call('follow_up', dict(original, prompt='recall'))
+            self.assertFalse(error)
+            self.assertEqual(follow_up['session_id'], original['session_id'])
+            self.assertNotEqual(follow_up['turn_id'], original['turn_id'])
+            expect_event('turn.completed', follow_up, 'end_turn')
+            _, continued = call('inspect_session', follow_up)
+            self.assertEqual(continued['result'], 'pong')
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=1.2)
+
     def test_verified_webhooks_for_confirmed_outcomes(self):
         receiver=ThreadingHTTPServer(('127.0.0.1',0),Receiver); receiver.messages=queue.Queue(); receiver.wrong=True
         threading.Thread(target=receiver.serve_forever,daemon=True).start()
