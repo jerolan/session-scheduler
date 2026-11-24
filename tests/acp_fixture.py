@@ -8,6 +8,9 @@ for line in sys.stdin:
     elif method == 'session/new': result = {'sessionId':'fixture-session'}
     elif method == 'session/prompt':
         prompt = msg['params']['prompt'][0]['text']
+        if prompt == 'check_scheduler_environment' and any(key.startswith('SESSION_SCHEDULER_') or key in ('CONTROL_PLANE_API_KEY','OPENAI_ADMIN_KEY') for key in os.environ):
+            print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32603,'message':'unexpected scheduler environment'}}), flush=True)
+            continue
         if prompt == 'error':
             print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32603,'message':'fixture failure'}}), flush=True)
             continue

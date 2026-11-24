@@ -6,7 +6,7 @@ FIXTURE = str(Path(__file__).resolve().parent / 'acp_fixture.py')
 class Acceptance(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        env = dict(os.environ, SESSION_SCHEDULER_WORKSPACES=self.tmp.name, SESSION_SCHEDULER_ACP_COMMAND=FIXTURE)
+        env = dict(os.environ, SESSION_SCHEDULER_WORKSPACES=self.tmp.name, SESSION_SCHEDULER_ACP_COMMAND=FIXTURE, SESSION_SCHEDULER_BEARER_TOKEN='secret', SESSION_SCHEDULER_CALLBACK_URL='secret', SESSION_SCHEDULER_ACCOUNT='secret', SESSION_SCHEDULER_STATE_DIR='secret')
         self.p = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
         self.n = 0
     def tearDown(self):
@@ -34,6 +34,9 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(current['history'], [{'role':'user', 'text':'hello'}, {'role':'agent', 'text':'fixture result'}])
         self.assertEqual(current['turn_id'], created['turn_id'])
         self.assertEqual(len(json.loads(self.call('list_sessions', {})['content'][0]['text'])), 1)
+    def test_scheduler_credentials_are_not_inherited_by_agent(self):
+        self.assertEqual(self.finish('check_scheduler_environment')['status'], 'completed')
+
     def test_foreign_session_data_is_ignored_and_permissions_denied(self):
         current = self.finish('foreign')
         self.assertEqual(current['result'], 'fixture result')

@@ -1,3 +1,5 @@
+mod events;
+mod http;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -30,11 +32,27 @@ fn send(writer: &mut impl Write, value: Value) -> io::Result<()> {
     writeln!(writer, "{value}")?;
     writer.flush()
 }
-fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, command: PathBuf) {
+fn run_acp(
+    sessions: Sessions,
+    id: String,
+    workspace: PathBuf,
+    prompt: String,
+    command: PathBuf,
+    events: Option<Arc<events::Events>>,
+) {
     let mut submitted = false;
     let run = || -> io::Result<()> {
+        let mut agent_command = Command::new(command);
+        for (key, _) in env::vars_os() {
+            if key.to_string_lossy().starts_with("SESSION_SCHEDULER_")
+                || key == "CONTROL_PLANE_API_KEY"
+                || key == "OPENAI_ADMIN_KEY"
+            {
+                agent_command.env_remove(key);
+            }
+        }
         let mut child = Agent(
-            Command::new(command)
+            agent_command
                 .current_dir(&workspace)
                 .env("INITIAL_AGENT_MODE", "read-only")
                 .env_remove("CODEX_CONFIG")
@@ -171,29 +189,81 @@ fn run_acp(sessions: Sessions, id: String, workspace: PathBuf, prompt: String, c
             s["status"] = json!(if submitted { "unknown" } else { "failed" });
         });
     }
+    if let Some(events) = events {
+        let record = sessions.lock().unwrap().get(&id).cloned();
+        if let Some(record) = record {
+            let reason = match (record["status"].as_str(), record["stop_reason"].as_str()) {
+                (Some("completed"), _) => Some("end_turn"),
+                (Some("cancelled"), _) => Some("cancelled"),
+                (Some("failed"), Some("refusal")) => Some("refusal"),
+                (Some("failed"), Some("max_tokens")) => Some("max_tokens"),
+                (Some("failed"), Some("max_turn_requests")) => Some("max_turn_requests"),
+                (Some("failed"), _) => Some("failed"),
+                _ => None,
+            };
+            if let (Some(reason), Some(turn_id)) = (reason, record["turn_id"].as_str()) {
+                events.complete(&id, turn_id, reason);
+            }
+        }
+    }
 }
-fn main() {
-    let allowed: Vec<PathBuf> = env::var_os("SESSION_SCHEDULER_WORKSPACES")
-        .map(|v| {
-            env::split_paths(&v)
-                .filter_map(|p| p.canonicalize().ok())
-                .filter(|p| p.is_dir())
-                .collect()
-        })
-        .unwrap_or_default();
-    let command = env::var_os("SESSION_SCHEDULER_ACP_COMMAND")
-        .map(PathBuf::from)
-        .and_then(|p| p.canonicalize().ok());
-    let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
-    for line in io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        let Ok(request) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+type Launch = (
+    Sessions,
+    String,
+    PathBuf,
+    String,
+    PathBuf,
+    Option<Arc<events::Events>>,
+);
+fn launch(job: Launch) {
+    let (shared, id, workspace, prompt, command, events) = job;
+    thread::spawn(move || run_acp(shared, id, workspace, prompt, command, events));
+}
+struct State {
+    allowed: Vec<PathBuf>,
+    command: Option<PathBuf>,
+    sessions: Sessions,
+    events: Option<Arc<events::Events>>,
+}
+impl State {
+    fn new(events: Option<Arc<events::Events>>) -> Self {
+        let allowed: Vec<PathBuf> = env::var_os("SESSION_SCHEDULER_WORKSPACES")
+            .map(|v| {
+                env::split_paths(&v)
+                    .filter_map(|p| p.canonicalize().ok())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let command = env::var_os("SESSION_SCHEDULER_ACP_COMMAND")
+            .map(PathBuf::from)
+            .and_then(|p| p.canonicalize().ok());
+        Self {
+            allowed,
+            command,
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            events,
+        }
+    }
+    fn dispatch(&self, request: Value) -> (Option<Value>, Option<Launch>) {
         let Some(id) = request.get("id") else {
-            continue;
+            return (None, None);
         };
         let method = request["method"].as_str().unwrap_or("");
+        if let Some(events) = &self.events {
+            if let Some(response) = events.dispatch(method, &request["params"]) {
+                return (
+                    Some(match response {
+                        Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
+                        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":error}),
+                    }),
+                    None,
+                );
+            }
+        }
+        let allowed = &self.allowed;
+        let command = &self.command;
+        let sessions = &self.sessions;
         let mut launch = None;
         let response = match method {
             "initialize" => {
@@ -202,7 +272,12 @@ fn main() {
                 } else {
                     "2025-11-25"
                 };
-                json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"session-scheduler","version":"0.1.0"}})
+                let capabilities = if self.events.is_some() {
+                    json!({"tools":{},"events":{}})
+                } else {
+                    json!({"tools":{}})
+                };
+                json!({"protocolVersion":version,"capabilities":capabilities,"serverInfo":{"name":"session-scheduler","version":"0.1.0"}})
             }
             "ping" => json!({}),
             "tools/list" => {
@@ -242,7 +317,7 @@ fn main() {
                             let tid = Uuid::new_v4().to_string();
                             let record = json!({"session_id":sid,"turn_id":tid,"workspace":workspace,"status":"running","result":"","history":[{"role":"user","text":prompt}],"acp_session_id":null,"stop_reason":null});
                             sessions.lock().unwrap().insert(sid.clone(), record);
-                            let shared = Arc::clone(&sessions);
+                            let shared = Arc::clone(sessions);
                             let worker_id = sid.clone();
                             let prompt = prompt.to_owned();
                             launch = Some((shared, worker_id, workspace, prompt, command));
@@ -255,23 +330,45 @@ fn main() {
                 }
             }
             _ => {
-                let response = json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}});
-                println!("{response}");
-                let _ = io::stdout().flush();
-                continue;
+                return (
+                    Some(
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}}),
+                    ),
+                    None,
+                );
             }
         };
-        let mut stdout = io::stdout().lock();
-        if send(
-            &mut stdout,
-            json!({"jsonrpc":"2.0","id":id,"result":response}),
+        let job = launch.map(|(shared, id, workspace, prompt, command)| {
+            (shared, id, workspace, prompt, command, self.events.clone())
+        });
+        (
+            Some(json!({"jsonrpc":"2.0","id":id,"result":response})),
+            job,
         )
-        .is_err()
-        {
-            break;
+    }
+}
+fn main() {
+    if env::var_os("SESSION_SCHEDULER_HTTP_PORT").is_some() {
+        if let Err(error) = http::serve() {
+            eprintln!("HTTP server: {error}");
+            std::process::exit(1);
         }
-        if let Some((shared, worker_id, workspace, prompt, command)) = launch {
-            thread::spawn(move || run_acp(shared, worker_id, workspace, prompt, command));
+        return;
+    }
+    let state = State::new(None);
+    for line in io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (response, job) = state.dispatch(request);
+        if let Some(response) = response {
+            if send(&mut io::stdout().lock(), response).is_err() {
+                break;
+            }
+            if let Some(job) = job {
+                launch(job);
+            }
         }
     }
 }
