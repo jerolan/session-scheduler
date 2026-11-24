@@ -285,6 +285,23 @@ class Acceptance(unittest.TestCase):
             {'type': 'tool_call', 'tool_call_id': 'replayed-tool', 'status': 'completed'},
         ])
 
+    def test_recovery_extends_text_before_a_tool_within_its_turn(self):
+        previous = self.finish('remember:repeat')
+        self.assertEqual(previous['result'], 'pong completo')
+        args = {'session_id': previous['session_id'], 'prompt': 'recover_tool_tail'}
+        response = self.call('follow_up', args)
+        self.assertFalse(response['isError'], response['content'])
+        ids = json.loads(response['content'][0]['text'])
+        recovered = self.wait_for_status(ids, 'completed')
+        self.assertEqual(recovered['result'], 'pong completo')
+        self.assertEqual(recovered['history'], previous['history'] + [
+            {'role': 'user', 'text': 'recover_tool_tail'},
+            {'role': 'agent', 'text': 'pong completo'},
+            {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'in_progress'},
+            {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'completed'},
+        ])
+        self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+
     def test_stalled_recovery_is_bounded_and_keeps_original_turn(self):
         args = {'workspace': self.tmp.name, 'prompt': 'recover_stalled'}
         ids = json.loads(self.call('delegate', args)['content'][0]['text'])

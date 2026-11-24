@@ -132,6 +132,29 @@ fn update(sessions: &Sessions, id: &str, f: impl FnOnce(&mut Value)) {
         f(session);
     }
 }
+fn turn_state_mut<'a>(record: &'a mut Value, turn_id: &str) -> Option<&'a mut Value> {
+    if record["turn_id"] == turn_id {
+        Some(record)
+    } else {
+        record.get_mut("previous_turns")?.get_mut(turn_id)
+    }
+}
+
+fn session_has_status(record: &Value, statuses: &[&str]) -> bool {
+    std::iter::once(record)
+        .chain(
+            record["previous_turns"]
+                .as_object()
+                .into_iter()
+                .flat_map(|turns| turns.values()),
+        )
+        .any(|turn| {
+            turn["status"]
+                .as_str()
+                .is_some_and(|status| statuses.contains(&status))
+        })
+}
+
 fn finish_turn(
     sessions: &Sessions,
     events: Option<&events::Events>,
@@ -143,7 +166,9 @@ fn finish_turn(
 ) {
     if events.is_some() {
         update(sessions, id, |record| {
-            record["status"] = json!("completion_pending")
+            if let Some(turn) = turn_state_mut(record, turn_id) {
+                turn["status"] = json!("completion_pending");
+            }
         });
     }
     let publish = {
@@ -153,9 +178,15 @@ fn finish_turn(
         let stop_reason = json!(stop_reason);
         move || {
             update(&sessions, &id, |record| {
-                if record["turn_id"] == turn_id {
-                    record["status"] = json!(status);
-                    record["stop_reason"] = stop_reason;
+                if let Some(turn) = turn_state_mut(record, &turn_id) {
+                    turn["status"] = json!(status);
+                    turn["stop_reason"] = stop_reason;
+                    if let Some(ids) = record
+                        .get_mut("unresolved_turn_ids")
+                        .and_then(Value::as_array_mut)
+                    {
+                        ids.retain(|id| id != &turn_id);
+                    }
                 }
             });
         }
@@ -226,7 +257,9 @@ impl Drop for Launch {
         if self.action.is_some() {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(record) = sessions.get_mut(&self.id) {
-                if record["turn_id"] == self.turn_id {
+                if record["turn_id"] == self.turn_id
+                    || record["previous_turns"][&self.turn_id]["status"] == "recovering"
+                {
                     if let Some(previous) = self.previous.take() {
                         *record = previous;
                     } else {
@@ -268,7 +301,9 @@ fn launch(mut job: Launch) {
             if let Err(error) = sender.send(work) {
                 if matches!(error.0, Work::Reconnect { .. }) {
                     update(&job.sessions, &job.id, |record| {
-                        record["status"] = json!("unknown")
+                        if let Some(turn) = turn_state_mut(record, &job.turn_id) {
+                            turn["status"] = json!("unknown");
+                        }
                     });
                     return;
                 }
@@ -394,7 +429,19 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if record["status"] != "unknown" || record["archived"] == true {
+        let turn_id = match args.get("turn_id") {
+            None => record["turn_id"].as_str(),
+            Some(id) => id.as_str(),
+        };
+        let Some(turn_id) = turn_id.map(str::to_owned) else {
+            return (result(json!("Invalid turn ID"), true), None);
+        };
+        if session_has_status(
+            record,
+            &["running", "cancelling", "completion_pending", "recovering"],
+        ) || record["archived"] == true
+            || !turn_state_mut(record, &turn_id).is_some_and(|turn| turn["status"] == "unknown")
+        {
             return (
                 result(json!("Session does not require recovery"), true),
                 None,
@@ -417,17 +464,14 @@ impl State {
             Some("opencode") => (AgentKind::OpenCode, &self.opencode_command),
             _ => return (result(json!("Unknown agent"), true), None),
         };
-        let (Some(executable), Some(acp_id), Some(turn_id)) = (
-            executable.clone(),
-            record["acp_session_id"].as_str(),
-            record["turn_id"].as_str(),
-        ) else {
+        let (Some(executable), Some(acp_id)) =
+            (executable.clone(), record["acp_session_id"].as_str())
+        else {
             return (result(json!("Session is not available"), true), None);
         };
-        let turn_id = turn_id.to_owned();
         let acp_id = acp_id.to_owned();
         let previous = record.clone();
-        record["status"] = json!("recovering");
+        turn_state_mut(record, &turn_id).unwrap()["status"] = json!("recovering");
         let mut workers = self.workers.lock().unwrap();
         let action = if let Some(sender) = workers.get(id) {
             Action::Send(
@@ -483,9 +527,9 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if matches!(
-            record["status"].as_str(),
-            Some("running" | "cancelling" | "completion_pending" | "recovering")
+        if session_has_status(
+            record,
+            &["running", "cancelling", "completion_pending", "recovering"],
         ) || record["archived"] == true
         {
             return (result(json!("Session is not available"), true), None);
@@ -517,14 +561,25 @@ impl State {
         let previous = record.clone();
         let tid = Uuid::new_v4().to_string();
         if record["status"] == "unknown" {
-            let unresolved = record["turn_id"].clone();
+            let unresolved = record["turn_id"].as_str().unwrap().to_owned();
+            let history_turn_index = record["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["role"] == "user")
+                .count()
+                - 1;
+            record["previous_turns"][&unresolved] = json!({
+                "status": "unknown", "stop_reason": null, "result": record["result"],
+                "history_turn_index": history_turn_index,
+            });
             if record["unresolved_turn_ids"].is_null() {
                 record["unresolved_turn_ids"] = json!([]);
             }
             record["unresolved_turn_ids"]
                 .as_array_mut()
                 .unwrap()
-                .push(unresolved);
+                .push(json!(unresolved));
         }
         record["turn_id"] = json!(tid);
         record["status"] = json!("running");
@@ -596,6 +651,9 @@ impl State {
             record["status"].as_str(),
             Some("completed" | "failed" | "cancelled")
         ) || record["archived"] == true
+            || record["unresolved_turn_ids"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
         {
             return result(json!("Session cannot be archived"), true);
         }
@@ -650,7 +708,7 @@ impl State {
                         },
                         "required":["workspace","prompt"]
                     }
-                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover the existing session and check the original turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
+                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
             }
             "tools/call" => {
                 let args = &request["params"]["arguments"];

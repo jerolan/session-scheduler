@@ -14,6 +14,7 @@ def tool_update(tool_id, status):
 
 memory = None
 remembered_prompt = None
+remembered_reply = None
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
@@ -33,9 +34,9 @@ for line in sys.stdin:
         interrupted.write_text(json.dumps(previous))
         if previous['mode'] == 'recover_no_evidence' and previous['loads'] > 1:
             sys.exit(1)
-        if previous.get('remembered_prompt'):
+        if previous.get('remembered_prompt') and previous['mode'] != 'recover_unmarked':
             update(previous['remembered_prompt'], role='user')
-            update('remembered')
+            update(previous.get('remembered_reply', 'remembered'))
         if previous['mode'] == 'recover_auto':
             update('recover_', role='user')
             update('auto', role='user')
@@ -44,6 +45,30 @@ for line in sys.stdin:
             update('ng completo')
             update('foreign history', target='foreign')
             tool_update('replayed-tool', 'completed')
+        elif previous['mode'] == 'recover_unmarked':
+            update('pong completo')
+        elif previous['mode'] == 'recover_interleaved_tools':
+            update(previous['mode'], role='user')
+            update('pong completo')
+            tool_update('A', 'completed')
+            tool_update('B', 'completed')
+        elif previous['mode'] in ('recover_interleaved_text', 'recover_partial'):
+            update(previous['mode'], role='user')
+            if previous['mode'] == 'recover_partial':
+                update('pong')
+            else:
+                update('pong com')
+                tool_update('A', 'completed')
+                update('pleto')
+            tool_update('B', 'completed')
+        elif previous['mode'] in ('recover_tool_tail', 'recover_late'):
+            update(previous['mode'], role='user')
+            ready = previous['mode'] == 'recover_tool_tail' or Path('outcome-ready').exists()
+            update('pong completo' if ready else 'pong')
+            tool_update('tail-tool', 'completed' if ready else 'in_progress')
+            for prompt, answer in previous.get('follow_ups', []):
+                update(prompt, role='user')
+                update(answer)
         else:
             update('pong')
         result = {}
@@ -55,6 +80,14 @@ for line in sys.stdin:
         if previous['mode'] == 'recover_manual' and Path('outcome-ready').exists():
             result['_meta'] = {'session-scheduler/turnOutcome': {
                 'sessionId': session_id, 'promptRequestId': previous['request'], 'stopReason': 'end_turn'}}
+        if previous['mode'] in ('recover_tool_tail', 'recover_interleaved_tools',
+                                'recover_interleaved_text', 'recover_unmarked') or (
+                previous['mode'] == 'recover_late' and Path('outcome-ready').exists()):
+            mismatch = Path('outcome-ready').read_text() if previous['mode'] == 'recover_late' else ''
+            result['_meta'] = {'session-scheduler/turnOutcome': {
+                'sessionId': 'wrong-session' if mismatch == 'session' else session_id,
+                'promptRequestId': 'wrong-turn' if mismatch == 'turn' else previous['request'],
+                'stopReason': 'end_turn'}}
         if previous['mode'] == 'recover_stalled' and previous['loads'] == 1:
             time.sleep(30)
     elif method == 'session/prompt':
@@ -91,10 +124,22 @@ for line in sys.stdin:
             Path('invocations').write_text('x')
             interrupted.write_text(json.dumps({
                 'session': session_id, 'request': msg['id'], 'mode': prompt, 'loads': 0,
-                'remembered_prompt': remembered_prompt}))
+                'remembered_prompt': remembered_prompt, 'remembered_reply': remembered_reply}))
             if prompt == 'recover_auto':
                 tool_update('observed-tool', 'in_progress')
             update('pong')
+            if prompt == 'recover_interleaved_tools':
+                tool_update('A', 'in_progress')
+                tool_update('B', 'in_progress')
+                tool_update('A', 'completed')
+            if prompt in ('recover_interleaved_text', 'recover_partial'):
+                tool_update('A', 'in_progress')
+                update(' com')
+                tool_update('B', 'in_progress')
+                tool_update('A', 'completed')
+                update('pleto')
+            if prompt in ('recover_tool_tail', 'recover_late'):
+                tool_update('tail-tool', 'in_progress')
             sys.exit(0)
         if prompt == 'disconnect':
             counter = Path('invocations')
@@ -121,7 +166,8 @@ for line in sys.stdin:
         if prompt.startswith('remember:'):
             remembered_prompt = prompt
             memory = prompt.removeprefix('remember:')
-            text = 'remembered'
+            text = 'pong completo' if memory == 'repeat' else 'remembered'
+            remembered_reply = text
         elif prompt == 'recall':
             text = memory or 'no memory'
         if prompt == 'identify_agent':
@@ -131,6 +177,11 @@ for line in sys.stdin:
                 text = 'codex fixture result'
             else:
                 sys.exit(1)
+        if interrupted.exists():
+            previous = json.loads(interrupted.read_text())
+            if previous['mode'] == 'recover_late':
+                previous.setdefault('follow_ups', []).append([prompt, text])
+                interrupted.write_text(json.dumps(previous))
         time.sleep(1)
         print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':text}}}}), flush=True)
         result = {'stopReason': prompt if prompt in ('cancelled','refusal','max_tokens','max_turn_requests','future_reason') else 'end_turn'}

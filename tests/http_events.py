@@ -1,5 +1,5 @@
 import base64, hashlib, hmac, http.client, json, os, queue, socket, subprocess, tempfile, threading, time, unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 BIN = str(Path(__file__).resolve().parents[1] / 'target/debug/session-scheduler')
@@ -234,7 +234,8 @@ class HttpEvents(unittest.TestCase):
                 conn.request('GET','/mcp',headers=headers); r=conn.getresponse(); r.read(); self.assertEqual(r.status,405)
             finally:
                 p.kill(); p.wait(); conn.close()
-    def test_recovery_events_and_explicit_reconnection_correlate_with_original_turn(self):
+    @contextmanager
+    def recovery_mcp(self):
         with ExitStack() as cleanup:
             receiver = cleanup.enter_context(ThreadingHTTPServer(('127.0.0.1', 0), Receiver))
             receiver.messages = queue.Queue()
@@ -258,7 +259,7 @@ class HttpEvents(unittest.TestCase):
             cleanup.callback(scheduler.kill)
 
             def rpc(method, params):
-                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=7)
                 try:
                     connection.request('POST', '/mcp', json.dumps({
                         'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params,
@@ -305,6 +306,10 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(subscription, subscriptions[name])
             self.assertNotEqual(*subscriptions.values())
 
+            yield state, call, expect_event, receiver
+
+    def test_recovery_events_and_explicit_reconnection_correlate_with_original_turn(self):
+        with self.recovery_mcp() as (state, call, expect_event, receiver):
             error, auto = call('delegate', {'workspace': state, 'prompt': 'recover_auto'})
             self.assertFalse(error)
             expect_event('turn.completed', auto, 'end_turn')
@@ -369,6 +374,185 @@ class HttpEvents(unittest.TestCase):
             self.assertEqual((continued['result'], continued['acp_session_id']),
                              ('pong', unresolved['acp_session_id']))
             self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=1.2)
+
+    def test_recovery_merges_interleaved_tool_updates(self):
+        with self.recovery_mcp() as (state, call, expect_event, _):
+            prompt = 'recover_interleaved_tools'
+            error, original = call('delegate', {'workspace': state, 'prompt': prompt})
+            self.assertFalse(error)
+            expect_event('turn.completed', original, 'end_turn')
+            _, record = call('inspect_session', original)
+            self.assertEqual((record['status'], record['result'], record['history']), (
+                'completed', 'pong completo', [
+                    {'role': 'user', 'text': prompt},
+                    {'role': 'agent', 'text': 'pong completo'},
+                    {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+                    {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
+                    {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'completed'},
+                    {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'completed'},
+                ],
+            ))
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+
+    def test_recovery_preserves_text_between_tools_and_across_turns(self):
+        with self.recovery_mcp() as (state, call, expect_event, _):
+            error, first = call('delegate', {'workspace': state, 'prompt': 'remember:repeat'})
+            self.assertFalse(error)
+            expect_event('turn.completed', first, 'end_turn')
+            _, before = call('inspect_session', first)
+            self.assertEqual(before['result'], 'pong completo')
+
+            prompt = 'recover_interleaved_text'
+            error, second = call('follow_up', dict(first, prompt=prompt))
+            self.assertFalse(error)
+            self.assertNotEqual(second['turn_id'], first['turn_id'])
+            expect_event('turn.completed', second, 'end_turn')
+            _, after = call('inspect_session', second)
+            self.assertEqual(after['result'], 'pong completo')
+            self.assertEqual(after['history'], before['history'] + [
+                {'role': 'user', 'text': prompt},
+                {'role': 'agent', 'text': 'pong'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+                {'role': 'agent', 'text': ' com'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'completed'},
+                {'role': 'agent', 'text': 'pleto'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'completed'},
+            ])
+
+    def test_partial_recovery_keeps_observed_text_without_confirming_outcome(self):
+        with self.recovery_mcp() as (state, call, expect_event, receiver):
+            prompt = 'recover_partial'
+            error, original = call('delegate', {'workspace': state, 'prompt': prompt})
+            self.assertFalse(error)
+            expect_event('turn.recovery_required', original, 'outcome_unknown')
+            _, record = call('inspect_session', original)
+            self.assertEqual((record['status'], record['result'], record['stop_reason']),
+                             ('unknown', 'pong completo', None))
+            self.assertEqual(record['history'], [
+                {'role': 'user', 'text': prompt},
+                {'role': 'agent', 'text': 'pong'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+                {'role': 'agent', 'text': ' com'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'completed'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'completed'},
+                {'role': 'agent', 'text': 'pleto'},
+            ])
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=.3)
+
+    def test_unmarked_replay_does_not_replace_a_turn_in_multi_turn_history(self):
+        with self.recovery_mcp() as (state, call, expect_event, _):
+            error, first = call('delegate', {'workspace': state, 'prompt': 'remember:repeat'})
+            self.assertFalse(error)
+            expect_event('turn.completed', first, 'end_turn')
+            _, before = call('inspect_session', first)
+            self.assertEqual(before['result'], 'pong completo')
+
+            prompt = 'recover_unmarked'
+            error, second = call('follow_up', dict(first, prompt=prompt))
+            self.assertFalse(error)
+            expect_event('turn.completed', second, 'end_turn')
+            _, after = call('inspect_session', second)
+            self.assertEqual((after['status'], after['result']), ('completed', 'pong'))
+            self.assertEqual(after['history'], before['history'] + [
+                {'role': 'user', 'text': prompt},
+                {'role': 'agent', 'text': 'pong'},
+            ])
+
+    def test_reconnect_resolves_older_turn_without_replacing_follow_up(self):
+        with self.recovery_mcp() as (state, call, expect_event, receiver):
+            error, original = call('delegate', {'workspace': state, 'prompt': 'recover_late'})
+            self.assertFalse(error)
+            expect_event('turn.recovery_required', original, 'outcome_unknown')
+            pending = Path(state, 'pending-events.json')
+            def wait_for_acknowledgement():
+                deadline = time.monotonic() + 7
+                while json.loads(pending.read_text()):
+                    if time.monotonic() >= deadline:
+                        self.fail('event was not acknowledged')
+                    time.sleep(.05)
+
+            wait_for_acknowledgement()
+
+            self.assertEqual(call('inspect_session', original)[1]['status'], 'unknown')
+            error, newer = call('follow_up', dict(original, prompt='explicit follow-up'))
+            self.assertFalse(error)
+            self.assertEqual(newer['session_id'], original['session_id'])
+            self.assertNotEqual(newer['turn_id'], original['turn_id'])
+            self.assertTrue(call('reconnect_session', original)[0])
+            expect_event('turn.completed', newer, 'end_turn')
+            latest = call('inspect_session', newer)[1]
+            self.assertEqual((latest['status'], latest['result']), ('completed', 'fixture result'))
+            self.assertEqual(latest['unresolved_turn_ids'], [original['turn_id']])
+            self.assertTrue(call('reconnect_session', dict(original, turn_id='unrelated'))[0])
+            self.assertTrue(call('archive_session', original)[0])
+
+            ready = Path(state, 'outcome-ready')
+            interrupted = Path(state, 'interrupted.json')
+            for mismatch in (None, 'session', 'turn'):
+                if mismatch:
+                    ready.write_text(mismatch)
+                self.assertEqual(call('reconnect_session', original),
+                                 (False, dict(original, status='recovering')))
+                for _ in range(100):
+                    current = call('inspect_session', newer)[1]
+                    if current == latest:
+                        break
+                    time.sleep(.02)
+                else:
+                    self.fail('nonmatching evidence changed the outcome or transcript')
+                with self.assertRaises(queue.Empty):
+                    receiver.messages.get(timeout=.3)
+
+            wait_for_acknowledgement()
+            pending.unlink()
+            pending.mkdir()
+            ready.write_text('')
+            self.assertEqual(call('reconnect_session', original),
+                             (False, dict(original, status='recovering')))
+            tid = original['turn_id']
+            for _ in range(100):
+                current = call('inspect_session', newer)[1]
+                if current['previous_turns'][tid]['status'] == 'completion_pending':
+                    break
+                time.sleep(.02)
+            else:
+                self.fail('historical completion did not wait for the outbox')
+            self.assertEqual(current['unresolved_turn_ids'], [tid])
+            for key in ('turn_id', 'status', 'stop_reason', 'result'):
+                self.assertEqual(current[key], latest[key])
+            for _ in range(3):
+                self.assertTrue(call('reconnect_session', original)[0])
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=.4)
+
+            pending.rmdir()
+            expect_event('turn.completed', original, 'end_turn')
+            resolved = call('inspect_session', newer)[1]
+            self.assertEqual(resolved['unresolved_turn_ids'], [])
+            outcome = resolved['previous_turns'][tid]
+            self.assertEqual((outcome['status'], outcome['stop_reason'], outcome['result']),
+                             ('completed', 'end_turn', 'pong completo'))
+            self.assertEqual(resolved['history'], [
+                {'role': 'user', 'text': 'recover_late'},
+                {'role': 'agent', 'text': 'pong completo'},
+                {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'completed'},
+                {'role': 'user', 'text': 'explicit follow-up'},
+                {'role': 'agent', 'text': 'fixture result'},
+            ])
+            for key in ('turn_id', 'status', 'stop_reason', 'result'):
+                self.assertEqual(resolved[key], latest[key])
+            self.assertTrue(call('reconnect_session', original)[0])
+            self.assertEqual(call('inspect_session', newer)[1], resolved)
+            self.assertFalse(call('archive_session', newer)[0])
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+            self.assertEqual(json.loads(interrupted.read_text())['follow_ups'],
+                             [['explicit follow-up', 'fixture result']])
             with self.assertRaises(queue.Empty):
                 receiver.messages.get(timeout=1.2)
 

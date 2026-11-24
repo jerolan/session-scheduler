@@ -1,9 +1,10 @@
 use crate::{
-    finish_turn, register_cancel, send, update, Adapter, AgentKind, CancelSlot, CancelWriters,
-    ChildRegistry, Sessions, Turn, Work,
+    finish_turn, register_cancel, send, session_has_status, turn_state_mut, update, Adapter,
+    AgentKind, CancelSlot, CancelWriters, ChildRegistry, Sessions, Turn, Work,
 };
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     env,
     io::{self, BufRead, BufReader},
     path::PathBuf,
@@ -58,54 +59,139 @@ fn append_history(history: &mut Vec<Value>, entry: Value, new_user_message: bool
     history.push(entry);
 }
 
-fn merge_turn(mut observed: &[Value], mut replay: &[Value]) -> Option<Vec<Value>> {
-    let mut merged = Vec::new();
-    while let Some(old) = observed.first() {
-        let new = replay.first()?;
-        if let Some(tool_id) = old["tool_call_id"]
-            .as_str()
-            .filter(|id| new["tool_call_id"] == *id)
-        {
-            // Replay can describe a tool call in its latest state, with fewer updates.
-            let same_tool = |entry: &Value| entry["tool_call_id"] == tool_id;
-            let old_count = observed.iter().take_while(|entry| same_tool(entry)).count();
-            let new_count = replay.iter().take_while(|entry| same_tool(entry)).count();
-            let updates = observed[..old_count].iter().chain(&replay[..new_count]);
-            let completed = updates.clone().find(|entry| entry["status"] == "completed");
-            let failed = updates.clone().find(|entry| entry["status"] == "failed");
-            if completed.is_some() && failed.is_some() {
-                return None;
-            }
-            for status in ["pending", "in_progress", "completed", "failed"] {
-                if let Some(entry) = updates.clone().find(|entry| entry["status"] == status) {
-                    merged.push(entry.clone());
+struct ToolUpdate<'a> {
+    text_offset: usize,
+    entry: &'a Value,
+}
+
+impl ToolUpdate<'_> {
+    fn stage(&self) -> usize {
+        match self.entry["status"].as_str() {
+            Some("pending") => 0,
+            Some("in_progress") => 1,
+            _ => 2,
+        }
+    }
+}
+
+fn split_turn(entries: &[Value]) -> (String, Vec<ToolUpdate<'_>>) {
+    let mut text = String::new();
+    let mut tools = Vec::new();
+    for entry in entries {
+        if let Some(chunk) = entry["text"].as_str() {
+            text.push_str(chunk);
+        } else if entry["type"] == "tool_call" {
+            tools.push(ToolUpdate {
+                text_offset: text.len(),
+                entry,
+            });
+        }
+    }
+    (text, tools)
+}
+
+fn merge_turn(observed: &[Value], replay: &[Value], has_user_boundary: bool) -> Option<Vec<Value>> {
+    let (observed_text, mut observed_tools) = split_turn(observed);
+    let (replayed_text, replayed_tools) = split_turn(replay);
+    // A load can omit tool updates and join the text chunks they used to separate.
+    let text = if replayed_text.starts_with(&observed_text) {
+        &replayed_text
+    } else if observed_text.starts_with(&replayed_text) {
+        &observed_text
+    } else {
+        return None;
+    };
+
+    if !observed_text.is_empty() && replayed_text.len() > observed_text.len() {
+        // Keep a trailing tool after any continuation in the same replayed text
+        // chunk. Tools between already observed text chunks keep their position.
+        let mut offset = 0;
+        for chunk in replay.iter().filter_map(|entry| entry["text"].as_str()) {
+            offset += chunk.len();
+            if offset >= observed_text.len() {
+                for tool in observed_tools
+                    .iter_mut()
+                    .rev()
+                    .take_while(|tool| tool.text_offset == observed_text.len())
+                {
+                    tool.text_offset = offset;
                 }
+                break;
             }
-            observed = &observed[old_count..];
-            replay = &replay[new_count..];
+        }
+    }
+
+    let mut tools = Vec::new();
+    let mut seen = BTreeSet::new();
+    for tool in observed_tools {
+        let id = tool.entry["tool_call_id"].as_str()?;
+        if seen.insert((id, tool.entry["status"].as_str()?)) {
+            tools.push(tool);
+        }
+    }
+    if !has_user_boundary
+        && (observed_text.is_empty() || replayed_text.is_empty())
+        && !replayed_tools.iter().any(|tool| {
+            tools
+                .iter()
+                .any(|observed| observed.entry["tool_call_id"] == tool.entry["tool_call_id"])
+        })
+    {
+        return None;
+    }
+
+    for mut tool in replayed_tools {
+        let id = tool.entry["tool_call_id"].as_str()?;
+        let status = tool.entry["status"].as_str()?;
+        if !seen.insert((id, status)) {
             continue;
         }
 
-        // The stream may have disconnected partway through the last observed message.
-        let extended = observed.len() == 1
-            && old["role"] == "agent"
-            && new["role"] == "agent"
-            && new["text"]
-                .as_str()
-                .unwrap()
-                .starts_with(old["text"].as_str().unwrap());
-        if old != new && !extended {
+        // Use the replayed position where possible. A collapsed or partial replay
+        // can put a state on the wrong side of an observed update for the same ID.
+        let mut lower = 0;
+        let mut upper = tools.len();
+        for (index, existing) in tools.iter().enumerate() {
+            if existing.entry["tool_call_id"] != id {
+                continue;
+            }
+            match existing.stage().cmp(&tool.stage()) {
+                std::cmp::Ordering::Less => lower = index + 1,
+                std::cmp::Ordering::Greater => upper = upper.min(index),
+                std::cmp::Ordering::Equal => return None,
+            }
+        }
+        if lower > upper {
             return None;
         }
-        merged.push(new.clone());
-        observed = &observed[1..];
-        replay = &replay[1..];
+        let index = tools
+            .partition_point(|existing| existing.text_offset <= tool.text_offset)
+            .clamp(lower, upper);
+        if let Some(previous) = index.checked_sub(1).and_then(|index| tools.get(index)) {
+            tool.text_offset = tool.text_offset.max(previous.text_offset);
+        }
+        if let Some(next) = tools.get(index) {
+            tool.text_offset = tool.text_offset.min(next.text_offset);
+        }
+        tools.insert(index, tool);
     }
-    merged.extend_from_slice(replay);
+
+    let mut merged = Vec::new();
+    let mut offset = 0;
+    for tool in tools {
+        if offset < tool.text_offset {
+            merged.push(json!({"role":"agent","text":&text[offset..tool.text_offset]}));
+        }
+        merged.push(tool.entry.clone());
+        offset = tool.text_offset;
+    }
+    if offset < text.len() {
+        merged.push(json!({"role":"agent","text":&text[offset..]}));
+    }
     Some(merged)
 }
 
-fn reconcile_history(record: &mut Value, replayed: &[Value]) {
+fn reconcile_history(record: &mut Value, turn_id: &str, replayed: &[Value]) {
     let history = record["history"].as_array().unwrap();
     let observed_turns: Vec<_> = history.chunk_by(|_, next| next["role"] != "user").collect();
     let replayed_turns: Vec<_> = replayed
@@ -124,25 +210,43 @@ fn reconcile_history(record: &mut Value, replayed: &[Value]) {
         return;
     }
 
-    let mut reconciled = Vec::new();
-    let mut last_result = String::new();
-    for (observed, replay) in observed_turns.into_iter().zip(replayed_turns) {
-        let replay = if unmarked { replay } else { &replay[1..] };
-        let observed_entries = &observed[1..];
-        let merged = merge_turn(observed_entries, replay);
-        let recovered = merged.as_deref().unwrap_or(observed_entries);
-        reconciled.push(observed[0].clone());
-        reconciled.extend_from_slice(recovered);
-        last_result.clear();
-        last_result.extend(
-            recovered
-                .iter()
-                .filter(|entry| entry["role"] == "agent")
-                .filter_map(|entry| entry["text"].as_str()),
-        );
+    let index = if record["turn_id"] == turn_id {
+        let Some(index) = observed_turns.len().checked_sub(1) else {
+            return;
+        };
+        index
+    } else {
+        let Some(index) = record["previous_turns"][turn_id]["history_turn_index"]
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            return;
+        };
+        index
+    };
+    let (Some(observed), Some(replay)) = (observed_turns.get(index), replayed_turns.get(index))
+    else {
+        return;
+    };
+    let replay = if unmarked { replay } else { &replay[1..] };
+    if let Some(merged) = merge_turn(&observed[1..], replay, !unmarked) {
+        let start = observed_turns[..index]
+            .iter()
+            .map(|turn| turn.len())
+            .sum::<usize>()
+            + 1;
+        let end = start + observed.len() - 1;
+        let result: String = merged
+            .iter()
+            .filter(|entry| entry["role"] == "agent")
+            .filter_map(|entry| entry["text"].as_str())
+            .collect();
+        record["history"]
+            .as_array_mut()
+            .unwrap()
+            .splice(start..end, merged);
+        turn_state_mut(record, turn_id).unwrap()["result"] = json!(result);
     }
-    record["result"] = json!(last_result);
-    record["history"] = json!(reconciled);
 }
 
 pub(super) enum Start {
@@ -403,21 +507,18 @@ impl AcpJob {
             ));
         }
         let loaded = evidence?;
+        let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
+        let reason = outcome["stopReason"].as_str().filter(|reason| {
+            outcome["sessionId"] == acp_id
+                && outcome["promptRequestId"] == turn_id
+                && known_stop_reason(reason)
+        });
         update(&self.sessions, &self.id, |record| {
-            if record["turn_id"] == turn_id {
-                reconcile_history(record, &history);
+            if record["turn_id"] == turn_id || reason.is_some() {
+                reconcile_history(record, turn_id, &history);
             }
         });
-        let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
-        if outcome["sessionId"] == acp_id && outcome["promptRequestId"] == turn_id {
-            if let Some(reason) = outcome["stopReason"]
-                .as_str()
-                .filter(|reason| known_stop_reason(reason))
-            {
-                return Ok((connection, Some(reason.to_owned())));
-            }
-        }
-        Ok((connection, None))
+        Ok((connection, reason.map(str::to_owned)))
     }
 
     fn prompt(
@@ -490,7 +591,9 @@ impl AcpJob {
             self.finish(turn_id, Some(reason));
         } else {
             update(&self.sessions, &self.id, |record| {
-                record["status"] = json!("unknown")
+                if let Some(turn) = turn_state_mut(record, turn_id) {
+                    turn["status"] = json!("unknown");
+                }
             });
         }
     }
@@ -517,10 +620,7 @@ impl AcpJob {
                 let records = self.sessions.lock().unwrap();
                 // A follow-up may already have reserved the turn and be about to queue it.
                 if !records.get(&self.id).is_some_and(|record| {
-                    matches!(
-                        record["status"].as_str(),
-                        Some("running" | "cancelling" | "recovering")
-                    )
+                    session_has_status(record, &["running", "cancelling", "recovering"])
                 }) {
                     self.retire();
                     return None;
@@ -566,9 +666,15 @@ impl AcpJob {
             let turn = match work {
                 Work::Prompt(turn) => turn,
                 Work::Reconnect { turn_id } => {
+                    let latest = self
+                        .sessions
+                        .lock()
+                        .unwrap()
+                        .get(&self.id)
+                        .is_some_and(|record| record["turn_id"] == turn_id);
                     let reason = match self.recover(&acp_id, &turn_id) {
                         Ok((loaded, reason)) => {
-                            if loaded.alive() {
+                            if loaded.alive() && (latest || !connection.alive()) {
                                 connection = loaded;
                             }
                             reason

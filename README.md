@@ -60,18 +60,28 @@ estado pasa a `unknown` y se registra `turn.recovery_required` con motivo
 la misma cola persistente que `turn.completed`.
 
 Una carga válida conserva la conexión y amplía el historial observado con
-las actualizaciones recuperadas que coinciden con la conversación. Si
-queda disponible la conexión y la sesión está sin un turno activo, una
+las actualizaciones recuperadas que coinciden con el turno. Conserva el
+orden del texto y de las actualizaciones de herramientas ya observadas.
+Una carga puede omitir estados intermedios de una herramienta. El scheduler
+usa el ID de la herramienta dentro del turno para incorporar los estados
+recuperados compatibles. Si la carga no permite identificar el turno,
+conserva el historial observado.
+
+Si queda disponible la conexión y la sesión está sin un turno activo, una
 llamada explícita a `follow_up` puede iniciar un turno con otro ID, aunque
 el desenlace original siga indeterminado. En ese caso,
 `inspect_session` conserva su ID en `unresolved_turn_ids` y muestra el
 estado y resultado del nuevo turno en los campos habituales.
 
-Llama a `reconnect_session` con `session_id` para hacer un intento adicional
-mientras el último turno esté en `unknown`. Si el adaptador confirma su
-desenlace, `turn.completed` lleva los IDs del turno original. Los intentos
-de recuperación solo inicializan el adaptador y solicitan la carga de la
-sesión existente.
+Llama a `reconnect_session` con `session_id` para reintentar el último
+turno en `unknown`. Añade `turn_id` para recuperar un turno anterior
+de `unresolved_turn_ids` cuando la sesión esté libre. `inspect_session`
+muestra su estado, resultado y motivo de cierre en `previous_turns`,
+por ID. Si el adaptador confirma su desenlace, `turn.completed` lleva
+los IDs originales y el turno sale de `unresolved_turn_ids` al quedar
+registrado el evento. Los campos del último turno conservan su valor.
+Resuelve los turnos indeterminados antes de archivar la sesión. La
+reconexión inicializa el adaptador y carga la sesión existente.
 
 ACP estándar puede recargar la conversación. Para confirmar el desenlace,
 el scheduler requiere que la respuesta de `session/load` incluya
