@@ -19,6 +19,17 @@ del entorno que lo ejecuta. El scheduler cancela las solicitudes ACP de
 permiso interactivo de ambos agentes. Codex sigue usando
 `SESSION_SCHEDULER_ACP_COMMAND`.
 
+## Encargo de seguimiento por MCP
+
+Para un encargo adicional explícito del usuario, llama a `follow_up` con el
+`session_id` devuelto por `delegate` y el nuevo `prompt`. La sesión debe
+seguir conectada y haber terminado el turno anterior. `follow_up` devuelve
+el mismo `session_id` y un nuevo `turn_id`.
+
+`inspect_session` conserva el ID de sesión ACP y el historial de la
+conversación. El estado y el resultado corresponden al turno más reciente.
+En HTTP, cada `turn.completed` informa el `turn_id` de su propio turno.
+
 ## Registro local en Codex Desktop
 
 En Windows, usa el arranque de desarrollo existente. El scheduler escucha por

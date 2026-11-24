@@ -50,6 +50,37 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(current['history'], [{'role':'user', 'text':'hello'}, {'role':'agent', 'text':'fixture result'}])
         self.assertEqual(current['turn_id'], created['turn_id'])
         self.assertEqual(len(json.loads(self.call('list_sessions', {})['content'][0]['text'])), 1)
+    def test_follow_up_preserves_context_and_history(self):
+        first = self.finish('remember:blue')
+        reply = self.call('follow_up', {'session_id':first['session_id'], 'prompt':'recall'})
+        self.assertFalse(reply['isError'], reply['content'])
+        second = json.loads(reply['content'][0]['text'])
+        self.assertEqual(second['session_id'], first['session_id'])
+        self.assertNotEqual(second['turn_id'], first['turn_id'])
+        for _ in range(50):
+            current = json.loads(self.call('inspect_session', {'session_id':first['session_id']})['content'][0]['text'])
+            if current['status'] != 'running': break
+            time.sleep(.1)
+        self.assertEqual(current['status'], 'completed')
+        self.assertTrue(first['acp_session_id'])
+        self.assertEqual(current['acp_session_id'], first['acp_session_id'])
+        self.assertEqual(current['result'], 'blue')
+        self.assertEqual(current['history'], [
+            {'role':'user','text':'remember:blue'}, {'role':'agent','text':'remembered'},
+            {'role':'user','text':'recall'}, {'role':'agent','text':'blue'}])
+
+    def test_follow_up_rejects_running_and_unusable_sessions(self):
+        created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':'hello'})['content'][0]['text'])
+        response = self.call('follow_up', {'session_id':created['session_id'], 'prompt':'recall'})
+        self.assertTrue(response['isError'])
+        current = json.loads(self.call('inspect_session', {'session_id':created['session_id']})['content'][0]['text'])
+        self.assertEqual(current['turn_id'], created['turn_id'])
+        self.assertEqual(current['history'][0], {'role':'user','text':'hello'})
+        self.assertNotIn({'role':'user','text':'recall'}, current['history'])
+        failed = self.finish('disconnect')
+        self.assertEqual(failed['status'], 'unknown')
+        self.assertTrue(self.call('follow_up', {'session_id':failed['session_id'], 'prompt':'recall'})['isError'])
+
     def test_scheduler_credentials_are_not_inherited_by_agent(self):
         self.assertEqual(self.finish('check_scheduler_environment')['status'], 'completed')
 

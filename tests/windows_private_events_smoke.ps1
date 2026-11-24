@@ -145,12 +145,23 @@ try {
     Check-PrivateAcl (Join-Path $state 'event-subscriptions.json')
     $verification = Next-Message; $body = $verification.body | ConvertFrom-Json
     Assert ($body.type -eq 'verification' -and $verification.subscription -eq $id) 'Verification or subscription ID mismatch'
-    function Check-Turn([string]$prompt, [string]$reason) {
-        $response = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt=$prompt}}
-        Assert ($null -eq $response.error) "Delegate failed: $($response | ConvertTo-Json -Depth 10 -Compress)"
+    function Check-Turn([string]$prompt, [string]$reason, [string]$sessionId) {
+        $call = if ($sessionId) {
+            @{name='follow_up';arguments=@{session_id=$sessionId;prompt=$prompt}}
+        } else {
+            @{name='delegate';arguments=@{workspace=$workspace;prompt=$prompt}}
+        }
+        $response = Rpc 'tools/call' $call
+        Assert ($null -eq $response.error -and -not $response.result.isError) "$($call.name) failed: $($response | ConvertTo-Json -Depth 10 -Compress)"
         $ids = $response.result.content[0].text | ConvertFrom-Json
         $message = Next-Message; $event = $message.body | ConvertFrom-Json
         Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.eventId -and $event.data.session_id -eq $ids.session_id -and $event.data.turn_id -eq $ids.turn_id -and $event.data.reason -eq $reason) "Completion mismatch: $($message.body)"
+        return @{ids=$ids;event=$event}
+    }
+    function Inspect([string]$sessionId) {
+        $response = Rpc 'tools/call' @{name='inspect_session';arguments=@{session_id=$sessionId}}
+        Assert ($null -eq $response.error -and -not $response.result.isError) 'Session inspection failed'
+        return $response.result.content[0].text | ConvertFrom-Json
     }
     if ($useOpenCode) {
         $tools = Rpc 'tools/list' @{}
@@ -183,12 +194,20 @@ try {
         } | ConvertTo-Json -Compress
         return
     }
-    Check-Turn 'permission' 'end_turn'
-    Check-Turn 'error' 'failed'
+    $null = Check-Turn 'permission' 'end_turn'
+    $first = Check-Turn 'Remember blue plum' 'end_turn'
+    $before = Inspect $first.ids.session_id
+    $second = Check-Turn 'What did I ask you to remember?' 'end_turn' $first.ids.session_id
+    $after = Inspect $second.ids.session_id
+    Assert ($first.ids.session_id -eq $second.ids.session_id -and $before.acp_session_id -and $before.acp_session_id -eq $after.acp_session_id) 'Follow-up did not reuse the scheduler and ACP session IDs'
+    Assert ($first.ids.turn_id -ne $second.ids.turn_id -and $first.event.eventId -ne $second.event.eventId) 'Follow-up completion was not distinguishable'
+    Assert ($after.result -ceq 'blue plum') 'Follow-up did not recall the first turn'
+    Assert (($after.history.text -join '|') -ceq 'Remember blue plum|Remembered.|What did I ask you to remember?|blue plum') 'Follow-up did not preserve the first turn in history'
+    $null = Check-Turn 'error' 'failed'
     Stop-Scheduler
     Start-Scheduler
     # The original subscription must deliver before any attempt to subscribe again.
-    Check-Turn 'error' 'failed'
+    $null = Check-Turn 'error' 'failed'
     $unsubscribed = Rpc 'events/unsubscribe' @{name='turn.completed';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Assert ($null -eq $unsubscribed.error) 'Unsubscribe did not atomically replace subscriptions'
     Check-PrivateAcl (Join-Path $state 'event-subscriptions.json')
@@ -216,6 +235,7 @@ try {
     }
     Write-Host 'PASS: Windows authenticated MCP and signed verification'
     Write-Host 'PASS: signed success and confirmed-failure events matched session and turn IDs'
+    Write-Host 'PASS: explicit follow-up kept ACP session and context with distinct signed completions'
     Write-Host 'PASS: persisted subscription, atomic replacement, protected ACLs and denied ACP approval'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {
