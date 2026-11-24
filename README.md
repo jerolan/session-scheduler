@@ -30,6 +30,17 @@ el mismo `session_id` y un nuevo `turn_id`.
 conversación. El estado y el resultado corresponden al turno más reciente.
 En HTTP, cada `turn.completed` informa el `turn_id` de su propio turno.
 
+## Cancelación y archivado por MCP
+
+Llama a `cancel_turn` con el `session_id` y el `turn_id` del turno activo.
+La sesión sigue visible en `list_sessions` con estado `cancelling` mientras
+espera la respuesta final de ACP. El evento `turn.completed` usa el motivo
+confirmado por el agente, incluido `end_turn` si el turno termina normalmente.
+
+Cuando el turno alcance un desenlace confirmado, llama a `archive_session`
+con el `session_id`. La sesión sale de `list_sessions` y sigue disponible
+en `inspect_session` con `archived: true`, su historial y su desenlace.
+
 ## Registro local en Codex Desktop
 
 En Windows, usa el arranque de desarrollo existente. El scheduler escucha por

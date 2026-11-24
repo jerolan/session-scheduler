@@ -18,6 +18,21 @@ for line in sys.stdin:
             continue
         if prompt == 'complete_and_exit':
             Path('fixture.pid').write_text(str(os.getpid()))
+        if prompt in ('wait_cancel', 'race_cancel'):
+            print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'before'}}}}), flush=True)
+            Path('prompt-ready').write_text('ready')
+            cancel = json.loads(sys.stdin.readline())
+            if cancel != {'jsonrpc':'2.0','method':'session/cancel','params':{'sessionId':session_id}}: sys.exit(1)
+            Path('cancel-ready').write_text('ready')
+            deadline = time.monotonic() + 10
+            while not Path('release-cancel').exists():
+                if time.monotonic() >= deadline: sys.exit(1)
+                time.sleep(.01)
+            Path('release-cancel').unlink()
+            print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'after'}}}}), flush=True)
+            result = {'stopReason': 'cancelled' if prompt == 'wait_cancel' else 'end_turn'}
+            print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}), flush=True)
+            continue
         if prompt == 'error':
             print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'error':{'code':-32603,'message':'fixture failure'}}), flush=True)
             continue

@@ -32,6 +32,41 @@ class Acceptance(unittest.TestCase):
         self.p.stdin.write(json.dumps({'jsonrpc':'2.0','id':self.n,'method':'tools/call','params':{'name':name,'arguments':args}})+'\n'); self.p.stdin.flush()
         response = json.loads(self.p.stdout.readline())
         return response['result']
+    def test_cancel_and_archive_preserve_confirmed_outcome(self):
+        for prompt, expected in [('wait_cancel', 'cancelled'), ('race_cancel', 'completed')]:
+            created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':prompt})['content'][0]['text'])
+            args = {'session_id':created['session_id'], 'turn_id':created['turn_id']}
+            deadline = time.monotonic() + 3
+            while not Path(self.tmp.name, 'prompt-ready').exists() and time.monotonic() < deadline: time.sleep(.01)
+            Path(self.tmp.name, 'prompt-ready').unlink()
+            self.assertTrue(any(s['session_id'] == args['session_id'] for s in json.loads(self.call('list_sessions', {})['content'][0]['text'])))
+            self.assertTrue(self.call('cancel_turn', {**args, 'turn_id':'wrong'})['isError'])
+            self.assertTrue(self.call('archive_session', {'session_id':args['session_id']})['isError'])
+            self.assertFalse(self.call('cancel_turn', args)['isError'])
+            deadline = time.monotonic() + 3
+            while not Path(self.tmp.name, 'cancel-ready').exists() and time.monotonic() < deadline: time.sleep(.01)
+            self.assertTrue(Path(self.tmp.name, 'cancel-ready').exists(), 'fixture did not receive cancellation')
+            Path(self.tmp.name, 'cancel-ready').unlink()
+            current = json.loads(self.call('inspect_session', {'session_id':args['session_id']})['content'][0]['text'])
+            self.assertEqual(current['status'], 'cancelling')
+            self.assertTrue(any(s['session_id'] == args['session_id'] for s in json.loads(self.call('list_sessions', {})['content'][0]['text'])))
+            self.assertTrue(self.call('archive_session', {'session_id':args['session_id']})['isError'])
+            Path(self.tmp.name, 'release-cancel').write_text('go')
+            for _ in range(100):
+                current = json.loads(self.call('inspect_session', {'session_id':args['session_id']})['content'][0]['text'])
+                if current['status'] != 'cancelling': break
+                time.sleep(.02)
+            self.assertEqual(current['status'], expected)
+            self.assertEqual(current['result'], 'beforeafter')
+            self.assertEqual(current['stop_reason'], 'cancelled' if expected == 'cancelled' else 'end_turn')
+            self.assertFalse(self.call('archive_session', {'session_id':args['session_id']})['isError'])
+            self.assertFalse(any(s['session_id'] == args['session_id'] for s in json.loads(self.call('list_sessions', {})['content'][0]['text'])))
+            archived = json.loads(self.call('inspect_session', {'session_id':args['session_id']})['content'][0]['text'])
+            self.assertTrue(archived['archived'])
+            self.assertEqual(archived['history'], current['history'])
+            self.assertEqual(archived['stop_reason'], current['stop_reason'])
+            self.assertTrue(self.call('follow_up', {'session_id':args['session_id'], 'prompt':'recall'})['isError'])
+
     def test_delegate_returns_identifiers_and_exposes_running_and_finished_result(self):
         start = time.monotonic()
         created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':'hello'})['content'][0]['text'])
@@ -95,6 +130,7 @@ class Acceptance(unittest.TestCase):
         self.assertNotIn({'role':'user','text':'recall'}, current['history'])
         failed = self.finish('disconnect')
         self.assertEqual(failed['status'], 'unknown')
+        self.assertTrue(self.call('archive_session', {'session_id':failed['session_id']})['isError'])
         self.assertTrue(self.call('follow_up', {'session_id':failed['session_id'], 'prompt':'recall'})['isError'])
 
     def test_scheduler_credentials_are_not_inherited_by_agent(self):

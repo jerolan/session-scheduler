@@ -7,7 +7,7 @@ use std::{
     env,
     io::{self, BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{mpsc, Arc, Mutex, Weak},
     thread,
     time::Duration,
@@ -47,6 +47,78 @@ struct Adapter {
     executable: PathBuf,
 }
 type Sessions = Arc<Mutex<BTreeMap<String, Value>>>;
+struct PendingCancel {
+    acp_id: String,
+    writer: Arc<Mutex<ChildStdin>>,
+    sent: bool,
+}
+type CancelSlot = Arc<Mutex<Option<PendingCancel>>>;
+type CancelWriters = Arc<Mutex<BTreeMap<String, CancelSlot>>>;
+fn schedule_cancel(slot: CancelSlot, sessions: Sessions, id: String, turn_id: String) {
+    thread::spawn(move || {
+        let writer = {
+            let guard = slot.lock().unwrap();
+            guard.as_ref().map(|pending| pending.writer.clone())
+        };
+        let Some(writer) = writer else {
+            return;
+        };
+        // Serialize with subsequent prompts, but do not hold state locks over I/O.
+        let mut writer = writer.lock().unwrap();
+        let acp_id = {
+            let mut guard = slot.lock().unwrap();
+            let records = sessions.lock().unwrap();
+            let current = records
+                .get(&id)
+                .is_some_and(|s| s["turn_id"] == turn_id && s["status"] == "cancelling");
+            match guard.as_mut() {
+                Some(pending) if current && !pending.sent => {
+                    pending.sent = true;
+                    Some(pending.acp_id.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(acp_id) = acp_id {
+            // A failed cancel write does not disprove an already-buffered prompt response.
+            // Keep reading until that response or EOF determines the turn's outcome.
+            let _ = send(
+                &mut *writer,
+                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":acp_id}}),
+            );
+        }
+    });
+}
+fn register_cancel(
+    slot: &CancelSlot,
+    sessions: &Sessions,
+    id: &str,
+    turn_id: &str,
+    acp_id: &str,
+    input: &Arc<Mutex<ChildStdin>>,
+) {
+    let cancelling = {
+        let mut guard = slot.lock().unwrap();
+        *guard = Some(PendingCancel {
+            acp_id: acp_id.to_owned(),
+            writer: input.clone(),
+            sent: false,
+        });
+        sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|s| s["turn_id"] == turn_id && s["status"] == "cancelling")
+    };
+    if cancelling {
+        schedule_cancel(
+            slot.clone(),
+            sessions.clone(),
+            id.to_owned(),
+            turn_id.to_owned(),
+        );
+    }
+}
 type Workers = Arc<Mutex<BTreeMap<String, mpsc::Sender<Turn>>>>;
 struct Turn {
     id: String,
@@ -75,6 +147,7 @@ struct AcpJob {
     children: Weak<Mutex<ChildRegistry>>,
     adapter: Adapter,
     events: Option<Arc<events::Events>>,
+    cancel_writers: CancelWriters,
 }
 
 fn run_acp(job: AcpJob) {
@@ -88,7 +161,9 @@ fn run_acp(job: AcpJob) {
         children,
         adapter,
         events,
+        cancel_writers,
     } = job;
+    let cancel_slot = cancel_writers.lock().unwrap().get(&id).unwrap().clone();
     let mut submitted = false;
     let mut turn = first;
     let run = || -> io::Result<()> {
@@ -126,13 +201,14 @@ fn run_acp(job: AcpJob) {
         )));
         registry.children.insert(id.clone(), child.0.clone());
         drop(registry);
-        let mut input = child
+        let input = child
             .0
             .lock()
             .unwrap()
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("missing stdin"))?;
+        let input = Arc::new(Mutex::new(input));
         let output = child
             .0
             .lock()
@@ -141,7 +217,7 @@ fn run_acp(job: AcpJob) {
             .take()
             .ok_or_else(|| io::Error::other("missing stdout"))?;
         send(
-            &mut input,
+            &mut *input.lock().unwrap(),
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"session-scheduler","version":"0.1.0"}}}),
         )?;
         let mut phase = 1;
@@ -154,7 +230,7 @@ fn run_acp(job: AcpJob) {
                 if method == "session/request_permission" {
                     if let Some(request_id) = message.get("id") {
                         send(
-                            &mut input,
+                            &mut *input.lock().unwrap(),
                             json!({"jsonrpc":"2.0","id":request_id,"result":{"outcome":{"outcome":"cancelled"}}}),
                         )?;
                     }
@@ -199,7 +275,7 @@ fn run_acp(job: AcpJob) {
                     }
                 } else if let Some(request_id) = message.get("id") {
                     send(
-                        &mut input,
+                        &mut *input.lock().unwrap(),
                         json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Method not supported"}}),
                     )?;
                 }
@@ -215,7 +291,7 @@ fn run_acp(job: AcpJob) {
             match phase {
                 1 => {
                     send(
-                        &mut input,
+                        &mut *input.lock().unwrap(),
                         json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":workspace,"mcpServers":[]}}),
                     )?;
                     phase = 2;
@@ -230,9 +306,10 @@ fn run_acp(job: AcpJob) {
                     // The running turn is already visible before sending the prompt.
                     submitted = true;
                     send(
-                        &mut input,
+                        &mut *input.lock().unwrap(),
                         json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":acp_id,"prompt":[{"type":"text","text":turn.prompt}]}}),
                     )?;
+                    register_cancel(&cancel_slot, &sessions, &id, &turn.id, acp_id, &input);
                     phase = 3;
                     request_id = 3;
                 }
@@ -245,10 +322,15 @@ fn run_acp(job: AcpJob) {
                         "cancelled" => "cancelled",
                         _ => "failed",
                     };
-                    update(&sessions, &id, |s| {
-                        s["status"] = json!(status);
-                        s["stop_reason"] = json!(reason);
-                    });
+                    {
+                        let mut slot = cancel_slot.lock().unwrap();
+                        let mut records = sessions.lock().unwrap();
+                        *slot = None;
+                        if let Some(s) = records.get_mut(&id) {
+                            s["status"] = json!(status);
+                            s["stop_reason"] = json!(reason);
+                        }
+                    }
                     if let Some(events) = &events {
                         let event_reason = match reason {
                             "end_turn" | "cancelled" | "refusal" | "max_tokens"
@@ -275,10 +357,9 @@ fn run_acp(job: AcpJob) {
                         }
                         let records = sessions.lock().unwrap();
                         // A follow-up reserves the running turn before queuing it.
-                        if records
-                            .get(&id)
-                            .is_some_and(|record| record["status"] == "running")
-                        {
+                        if records.get(&id).is_some_and(|record| {
+                            matches!(record["status"].as_str(), Some("running" | "cancelling"))
+                        }) {
                             continue;
                         }
                         if let Some(workers) = workers.upgrade() {
@@ -293,9 +374,17 @@ fn run_acp(job: AcpJob) {
                     submitted = true;
                     request_id += 1;
                     send(
-                        &mut input,
+                        &mut *input.lock().unwrap(),
                         json!({"jsonrpc":"2.0","id":request_id,"method":"session/prompt","params":{"sessionId":acp_session_id,"prompt":[{"type":"text","text":turn.prompt}]}}),
                     )?;
+                    register_cancel(
+                        &cancel_slot,
+                        &sessions,
+                        &id,
+                        &turn.id,
+                        acp_session_id.as_ref().unwrap(),
+                        &input,
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -306,7 +395,10 @@ fn run_acp(job: AcpJob) {
     if let Some(children) = children.upgrade() {
         children.lock().unwrap().children.remove(&id);
     }
+    cancel_writers.lock().unwrap().remove(&id);
     if outcome.is_err() {
+        let mut slot = cancel_slot.lock().unwrap();
+        *slot = None;
         let mut records = sessions.lock().unwrap();
         if let Some(workers) = workers.upgrade() {
             workers.lock().unwrap().remove(&id);
@@ -329,6 +421,7 @@ struct Launch {
     turn_id: String,
     previous: Option<Value>,
     events: Option<Arc<events::Events>>,
+    cancel_writers: CancelWriters,
 }
 enum Action {
     Start {
@@ -353,6 +446,7 @@ impl Drop for Launch {
                         sessions.remove(&self.id);
                         if let Some(Action::Start { workers, .. }) = &self.action {
                             workers.lock().unwrap().remove(&self.id);
+                            self.cancel_writers.lock().unwrap().remove(&self.id);
                         }
                     }
                 }
@@ -380,6 +474,7 @@ fn launch(mut job: Launch) {
                 children: Arc::downgrade(&children),
                 adapter,
                 events: job.events.clone(),
+                cancel_writers: job.cancel_writers.clone(),
             };
             thread::spawn(move || run_acp(acp));
         }
@@ -401,6 +496,7 @@ struct State {
     workers: Workers,
     children: Children,
     events: Option<Arc<events::Events>>,
+    cancel_writers: CancelWriters,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -430,6 +526,7 @@ impl State {
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             children: Arc::new(Mutex::new(ChildRegistry::default())),
+            cancel_writers: Arc::new(Mutex::new(BTreeMap::new())),
             events,
         }
     }
@@ -459,8 +556,12 @@ impl State {
         let record = json!({
             "session_id":sid, "turn_id":tid, "workspace":workspace, "agent":kind.name(),
             "status":"running", "result":"", "history":[{"role":"user","text":prompt}],
-            "acp_session_id":null, "stop_reason":null
+            "acp_session_id":null, "stop_reason":null, "archived":false
         });
+        self.cancel_writers
+            .lock()
+            .unwrap()
+            .insert(sid.clone(), Arc::new(Mutex::new(None)));
         self.sessions.lock().unwrap().insert(sid.clone(), record);
         let (sender, receiver) = mpsc::channel();
         self.workers.lock().unwrap().insert(sid.clone(), sender);
@@ -481,6 +582,7 @@ impl State {
             turn_id: tid.clone(),
             previous: None,
             events: self.events.clone(),
+            cancel_writers: self.cancel_writers.clone(),
         };
         (
             result(json!({"session_id":sid,"turn_id":tid}), false),
@@ -498,7 +600,11 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if record["status"] == "running" || record["status"] == "unknown" {
+        if record["status"] == "running"
+            || record["status"] == "cancelling"
+            || record["status"] == "unknown"
+            || record["archived"] == true
+        {
             return (result(json!("Session is not available"), true), None);
         }
         let Some(sender) = self.workers.lock().unwrap().get(id).cloned() else {
@@ -539,11 +645,62 @@ impl State {
             turn_id: tid.clone(),
             previous: Some(previous),
             events: self.events.clone(),
+            cancel_writers: self.cancel_writers.clone(),
         };
         (
             result(json!({"session_id":id,"turn_id":tid}), false),
             Some(job),
         )
+    }
+    fn cancel_turn(&self, args: &Value) -> Value {
+        let (Some(id), Some(turn_id)) = (args["session_id"].as_str(), args["turn_id"].as_str())
+        else {
+            return result(json!("Session and turn required"), true);
+        };
+        let mut records = self.sessions.lock().unwrap();
+        let Some(record) = records.get_mut(id) else {
+            return result(json!("Session not found"), true);
+        };
+        if record["turn_id"] != turn_id
+            || record["status"] != "running"
+            || record["archived"] == true
+        {
+            return result(json!("Turn is not available for cancellation"), true);
+        }
+        record["status"] = json!("cancelling");
+        drop(records);
+        if let Some(slot) = self.cancel_writers.lock().unwrap().get(id).cloned() {
+            schedule_cancel(
+                slot,
+                self.sessions.clone(),
+                id.to_owned(),
+                turn_id.to_owned(),
+            );
+        }
+        result(
+            json!({"session_id":id,"turn_id":turn_id,"status":"cancelling"}),
+            false,
+        )
+    }
+    fn archive_session(&self, args: &Value) -> Value {
+        let Some(id) = args["session_id"].as_str() else {
+            return result(json!("Session required"), true);
+        };
+        let mut records = self.sessions.lock().unwrap();
+        let Some(record) = records.get_mut(id) else {
+            return result(json!("Session not found"), true);
+        };
+        if !matches!(
+            record["status"].as_str(),
+            Some("completed" | "failed" | "cancelled")
+        ) || record["archived"] == true
+        {
+            return result(json!("Session cannot be archived"), true);
+        }
+        record["archived"] = json!(true);
+        self.workers.lock().unwrap().remove(id);
+        self.cancel_writers.lock().unwrap().remove(id);
+        result(json!({"session_id":id,"archived":true}), false)
     }
     fn dispatch(&self, request: Value) -> (Option<Value>, Option<Launch>) {
         let Some(id) = request.get("id") else {
@@ -591,7 +748,7 @@ impl State {
                         },
                         "required":["workspace","prompt"]
                     }
-                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
+                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
             }
             "tools/call" => {
                 let args = &request["params"]["arguments"];
@@ -601,6 +758,7 @@ impl State {
                             .lock()
                             .unwrap()
                             .values()
+                            .filter(|s| s["archived"] != true)
                             .map(|s| json!({"session_id":s["session_id"],"turn_id":s["turn_id"],"workspace":s["workspace"],"status":s["status"]}))
                             .collect::<Vec<_>>()),
                         false,
@@ -612,6 +770,8 @@ impl State {
                         Some(s) => result(s, false),
                         None => result(json!("Session not found"), true),
                     },
+                    "cancel_turn" => self.cancel_turn(args),
+                    "archive_session" => self.archive_session(args),
                     "follow_up" => {
                         let (response, job) = self.follow_up(args);
                         launch = job;
