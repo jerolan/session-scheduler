@@ -4,6 +4,7 @@ fn main() {
     let mut lines = io::stdin().lock().lines();
     let mut session_id = format!("fixture-{}", std::process::id());
     let mut remembered = false;
+    let mut loaded = false;
     while let Some(Ok(line)) = lines.next() {
         let response = if line.contains("\"initialize\"") {
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}"#
@@ -17,7 +18,14 @@ fn main() {
             let (session, original_request) = saved.split_once('\n').unwrap();
             assert!(line.contains(&format!(r#""sessionId":"{session}""#)));
             session_id = session.to_owned();
+            loaded = true;
             if std::path::Path::new("outcome-ready").exists() {
+                println!(
+                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{session_id}","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"disconnect with pong"}}}}}}}}"#
+                );
+                println!(
+                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{session_id}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"pong completo"}}}}}}}}"#
+                );
                 println!(
                     r#"{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{"session-scheduler/turnOutcome":{{"sessionId":"{session}","promptRequestId":{original_request},"stopReason":"end_turn"}}}}}}}}"#
                 );
@@ -75,6 +83,8 @@ fn main() {
                     Some("Remembered.")
                 } else if line.contains(r#""What did I ask you to remember?""#) && remembered {
                     Some("blue plum")
+                } else if line.contains(r#""What was the interrupted response?""#) && loaded {
+                    Some("pong")
                 } else {
                     None
                 };

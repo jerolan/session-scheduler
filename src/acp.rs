@@ -1,6 +1,6 @@
 use crate::{
     finish_turn, register_cancel, send, update, Adapter, AgentKind, CancelSlot, CancelWriters,
-    ChildRegistry, Sessions, Turn,
+    ChildRegistry, Sessions, Turn, Work,
 };
 use serde_json::{json, Value};
 use std::{
@@ -23,6 +23,128 @@ fn known_stop_reason(reason: &str) -> bool {
     )
 }
 
+fn visible_update(update: &Value, replay: bool) -> Option<Value> {
+    match update["sessionUpdate"].as_str()? {
+        "user_message_chunk" if replay => {
+            let text = update["content"]["text"].as_str().unwrap_or("");
+            Some(json!({"role":"user","text":text}))
+        }
+        "agent_message_chunk" if update["content"]["type"] == "text" => {
+            let text = update["content"]["text"].as_str()?;
+            Some(json!({"role":"agent","text":text}))
+        }
+        "tool_call" | "tool_call_update" => {
+            let id = update["toolCallId"].as_str()?;
+            let status = update["status"].as_str()?;
+            matches!(status, "pending" | "in_progress" | "completed" | "failed")
+                .then(|| json!({"type":"tool_call","tool_call_id":id,"status":status}))
+        }
+        _ => None,
+    }
+}
+
+fn append_history(history: &mut Vec<Value>, entry: Value, new_user_message: bool) {
+    if let Some(role) = entry["role"].as_str() {
+        if let Some(last) = history
+            .last_mut()
+            .filter(|last| last["role"] == role && !new_user_message)
+        {
+            let old = last["text"].as_str().unwrap();
+            let text = entry["text"].as_str().unwrap();
+            last["text"] = json!(format!("{old}{text}"));
+            return;
+        }
+    }
+    history.push(entry);
+}
+
+fn merge_turn(mut observed: &[Value], mut replay: &[Value]) -> Option<Vec<Value>> {
+    let mut merged = Vec::new();
+    while let Some(old) = observed.first() {
+        let new = replay.first()?;
+        if let Some(tool_id) = old["tool_call_id"]
+            .as_str()
+            .filter(|id| new["tool_call_id"] == *id)
+        {
+            // Replay can describe a tool call in its latest state, with fewer updates.
+            let same_tool = |entry: &Value| entry["tool_call_id"] == tool_id;
+            let old_count = observed.iter().take_while(|entry| same_tool(entry)).count();
+            let new_count = replay.iter().take_while(|entry| same_tool(entry)).count();
+            let updates = observed[..old_count].iter().chain(&replay[..new_count]);
+            let completed = updates.clone().find(|entry| entry["status"] == "completed");
+            let failed = updates.clone().find(|entry| entry["status"] == "failed");
+            if completed.is_some() && failed.is_some() {
+                return None;
+            }
+            for status in ["pending", "in_progress", "completed", "failed"] {
+                if let Some(entry) = updates.clone().find(|entry| entry["status"] == status) {
+                    merged.push(entry.clone());
+                }
+            }
+            observed = &observed[old_count..];
+            replay = &replay[new_count..];
+            continue;
+        }
+
+        // The stream may have disconnected partway through the last observed message.
+        let extended = observed.len() == 1
+            && old["role"] == "agent"
+            && new["role"] == "agent"
+            && new["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(old["text"].as_str().unwrap());
+        if old != new && !extended {
+            return None;
+        }
+        merged.push(new.clone());
+        observed = &observed[1..];
+        replay = &replay[1..];
+    }
+    merged.extend_from_slice(replay);
+    Some(merged)
+}
+
+fn reconcile_history(record: &mut Value, replayed: &[Value]) {
+    let history = record["history"].as_array().unwrap();
+    let observed_turns: Vec<_> = history.chunk_by(|_, next| next["role"] != "user").collect();
+    let replayed_turns: Vec<_> = replayed
+        .chunk_by(|_, next| next["role"] != "user")
+        .collect();
+    let unmarked =
+        observed_turns.len() == 1 && replayed_turns.len() == 1 && replayed[0]["role"] != "user";
+    if !unmarked
+        && (observed_turns.len() != replayed_turns.len()
+            || observed_turns
+                .iter()
+                .zip(&replayed_turns)
+                .any(|(old, new)| old[0] != new[0]))
+    {
+        // A replay without matching turn boundaries could describe a different turn.
+        return;
+    }
+
+    let mut reconciled = Vec::new();
+    let mut last_result = String::new();
+    for (observed, replay) in observed_turns.into_iter().zip(replayed_turns) {
+        let replay = if unmarked { replay } else { &replay[1..] };
+        let observed_entries = &observed[1..];
+        let merged = merge_turn(observed_entries, replay);
+        let recovered = merged.as_deref().unwrap_or(observed_entries);
+        reconciled.push(observed[0].clone());
+        reconciled.extend_from_slice(recovered);
+        last_result.clear();
+        last_result.extend(
+            recovered
+                .iter()
+                .filter(|entry| entry["role"] == "agent")
+                .filter_map(|entry| entry["text"].as_str()),
+        );
+    }
+    record["result"] = json!(last_result);
+    record["history"] = json!(reconciled);
+}
+
 pub(super) enum Start {
     New(Turn),
     Reconnect { acp_id: String, turn_id: String },
@@ -32,8 +154,8 @@ pub(super) struct AcpJob {
     pub sessions: Sessions,
     pub id: String,
     pub workspace: PathBuf,
-    pub receiver: mpsc::Receiver<Turn>,
-    pub workers: Weak<Mutex<std::collections::BTreeMap<String, mpsc::Sender<Turn>>>>,
+    pub receiver: mpsc::Receiver<Work>,
+    pub workers: Weak<Mutex<std::collections::BTreeMap<String, mpsc::Sender<Work>>>>,
     pub children: Weak<Mutex<ChildRegistry>>,
     pub adapter: Adapter,
     pub events: Option<Arc<crate::events::Events>>,
@@ -58,7 +180,13 @@ impl Drop for Connection {
             let _ = child.wait();
         }
         if let Some(children) = self.children.upgrade() {
-            children.lock().unwrap().children.remove(&self.id);
+            let mut registry = children.lock().unwrap();
+            if let Some(children) = registry.children.get_mut(&self.id) {
+                children.retain(|child| !Arc::ptr_eq(child, &self.child));
+                if children.is_empty() {
+                    registry.children.remove(&self.id);
+                }
+            }
         }
     }
 }
@@ -181,7 +309,11 @@ impl AcpJob {
             }
         });
         let child = Arc::new(Mutex::new(child));
-        registry.children.insert(self.id.clone(), child.clone());
+        registry
+            .children
+            .entry(self.id.clone())
+            .or_default()
+            .push(child.clone());
         Ok(Connection {
             child,
             children: self.children.clone(),
@@ -211,7 +343,7 @@ impl AcpJob {
         Ok((connection, id))
     }
 
-    fn recover(&self, acp_id: &str, turn_id: &str) -> io::Result<Option<(Connection, String)>> {
+    fn recover(&self, acp_id: &str, turn_id: &str) -> io::Result<(Connection, Option<String>)> {
         let workspace = self.workspace.canonicalize()?;
         if workspace != self.workspace || !workspace.is_dir() {
             return Err(io::Error::other("workspace changed"));
@@ -230,6 +362,8 @@ impl AcpJob {
                 let _ = child.lock().unwrap().kill();
             }
         });
+        let mut history = Vec::new();
+        let mut user_message_id = None;
         let evidence = (|| {
             let initialized = connection.initialize()?;
             if initialized["agentCapabilities"]["loadSession"] != true {
@@ -238,13 +372,26 @@ impl AcpJob {
                     "ACP session loading is unsupported",
                 ));
             }
-            // Load replays the history. Keep the scheduler's observed history unchanged.
-            // Replayed messages carry no proof about the interrupted prompt's outcome.
-            connection.setup(
-                2,
-                "session/load",
-                json!({"sessionId":acp_id,"cwd":workspace,"mcpServers":[]}),
-            )
+            connection.send(json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+                "params":{"sessionId":acp_id,"cwd":workspace,"mcpServers":[]}}))?;
+            connection
+                .response(&json!(2), |params| {
+                    if params["sessionId"] != acp_id {
+                        return;
+                    }
+                    let update = &params["update"];
+                    if let Some(entry) = visible_update(update, true) {
+                        let mut new_user_message = false;
+                        if entry["role"] == "user" {
+                            let message_id = update["messageId"].as_str();
+                            new_user_message =
+                                message_id.is_some() && message_id != user_message_id.as_deref();
+                            user_message_id = message_id.map(str::to_owned);
+                        }
+                        append_history(&mut history, entry, new_user_message);
+                    }
+                })?
+                .ok_or_else(|| io::Error::other("ACP session load failed"))
         })();
         let _ = done.send(());
         let _ = watchdog.join();
@@ -256,16 +403,21 @@ impl AcpJob {
             ));
         }
         let loaded = evidence?;
+        update(&self.sessions, &self.id, |record| {
+            if record["turn_id"] == turn_id {
+                reconcile_history(record, &history);
+            }
+        });
         let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
         if outcome["sessionId"] == acp_id && outcome["promptRequestId"] == turn_id {
             if let Some(reason) = outcome["stopReason"]
                 .as_str()
                 .filter(|reason| known_stop_reason(reason))
             {
-                return Ok(Some((connection, reason.to_owned())));
+                return Ok((connection, Some(reason.to_owned())));
             }
         }
-        Ok(None)
+        Ok((connection, None))
     }
 
     fn prompt(
@@ -301,35 +453,15 @@ impl AcpJob {
     }
 
     fn record_update(&self, u: &Value) {
-        if u["sessionUpdate"] == "agent_message_chunk" && u["content"]["type"] == "text" {
-            if let Some(text) = u["content"]["text"].as_str() {
-                update(&self.sessions, &self.id, |s| {
-                    let old = s["result"].as_str().unwrap_or("");
-                    s["result"] = json!(format!("{old}{text}"));
-                    let history = s["history"].as_array_mut().unwrap();
-                    if let Some(last) = history.last_mut().filter(|entry| entry["role"] == "agent")
-                    {
-                        let old = last["text"].as_str().unwrap_or("");
-                        last["text"] = json!(format!("{old}{text}"));
-                    } else {
-                        history.push(json!({"role":"agent","text":text}));
-                    }
-                });
-            }
-        } else if matches!(
-            u["sessionUpdate"].as_str(),
-            Some("tool_call" | "tool_call_update")
-        ) {
-            if let (Some(tool_id), Some(status)) = (u["toolCallId"].as_str(), u["status"].as_str())
-            {
-                if matches!(status, "pending" | "in_progress" | "completed" | "failed") {
-                    update(&self.sessions, &self.id, |s| {
-                        s["history"].as_array_mut().unwrap().push(
-                            json!({"type":"tool_call","tool_call_id":tool_id,"status":status}),
-                        );
-                    });
+        if let Some(entry) = visible_update(u, false) {
+            update(&self.sessions, &self.id, |record| {
+                if entry["role"] == "agent" {
+                    let old = record["result"].as_str().unwrap_or("");
+                    let text = entry["text"].as_str().unwrap();
+                    record["result"] = json!(format!("{old}{text}"));
                 }
-            }
+                append_history(record["history"].as_array_mut().unwrap(), entry, false);
+            });
         }
     }
 
@@ -353,6 +485,20 @@ impl AcpJob {
         );
     }
 
+    fn finish_reconnect(&self, turn_id: &str, reason: Option<&str>) {
+        if let Some(reason) = reason {
+            self.finish(turn_id, Some(reason));
+        } else {
+            update(&self.sessions, &self.id, |record| {
+                record["status"] = json!("unknown")
+            });
+        }
+    }
+
+    fn require_recovery(&self, turn_id: &str) {
+        crate::require_recovery(&self.sessions, self.events.as_deref(), &self.id, turn_id);
+    }
+
     fn retire(&self) {
         if let Some(workers) = self.workers.upgrade() {
             workers.lock().unwrap().remove(&self.id);
@@ -360,7 +506,7 @@ impl AcpJob {
         self.cancel_writers.lock().unwrap().remove(&self.id);
     }
 
-    fn next_turn(&self, connection: &Connection) -> Option<Turn> {
+    fn next_work(&self, connection: &Connection) -> Option<Work> {
         loop {
             match self.receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(turn) => return Some(turn),
@@ -371,7 +517,10 @@ impl AcpJob {
                 let records = self.sessions.lock().unwrap();
                 // A follow-up may already have reserved the turn and be about to queue it.
                 if !records.get(&self.id).is_some_and(|record| {
-                    matches!(record["status"].as_str(), Some("running" | "cancelling"))
+                    matches!(
+                        record["status"].as_str(),
+                        Some("running" | "cancelling" | "recovering")
+                    )
                 }) {
                     self.retire();
                     return None;
@@ -398,20 +547,38 @@ impl AcpJob {
                 }
             },
             Start::Reconnect { acp_id, turn_id } => match self.recover(&acp_id, &turn_id) {
-                Ok(Some((connection, reason))) => {
-                    self.finish(&turn_id, Some(&reason));
+                Ok((connection, reason)) => {
+                    self.finish_reconnect(&turn_id, reason.as_deref());
                     (connection, acp_id, None)
                 }
-                _ => {
+                Err(_) => {
                     self.retire();
-                    update(&self.sessions, &self.id, |record| {
-                        record["status"] = json!("unknown")
-                    });
+                    self.finish_reconnect(&turn_id, None);
                     return;
                 }
             },
         };
-        while let Some(turn) = first.take().or_else(|| self.next_turn(&connection)) {
+        while let Some(work) = first
+            .take()
+            .map(Work::Prompt)
+            .or_else(|| self.next_work(&connection))
+        {
+            let turn = match work {
+                Work::Prompt(turn) => turn,
+                Work::Reconnect { turn_id } => {
+                    let reason = match self.recover(&acp_id, &turn_id) {
+                        Ok((loaded, reason)) => {
+                            if loaded.alive() {
+                                connection = loaded;
+                            }
+                            reason
+                        }
+                        Err(_) => None,
+                    };
+                    self.finish_reconnect(&turn_id, reason.as_deref());
+                    continue;
+                }
+            };
             if !connection.alive() {
                 drop(connection);
                 self.retire();
@@ -439,30 +606,33 @@ impl AcpJob {
                             thread::sleep(Duration::from_millis(100));
                         }
                         match self.recover(&acp_id, &turn.id) {
-                            Ok(Some(loaded)) => {
-                                recovered = Some(loaded);
-                                break;
+                            Ok((loaded, reason)) => {
+                                let confirmed = reason.is_some();
+                                if confirmed || loaded.alive() {
+                                    recovered = Some((loaded, reason));
+                                }
+                                if confirmed {
+                                    break;
+                                }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Unsupported => break,
-                            _ => {}
+                            Err(_) => {}
                         }
                     }
-                    let Some((loaded, reason)) = recovered else {
+                    if let Some((loaded, reason)) = recovered {
+                        connection = loaded;
+                        if let Some(reason) = reason {
+                            self.finish(&turn.id, Some(&reason));
+                        } else {
+                            self.require_recovery(&turn.id);
+                        }
+                    } else {
                         self.retire();
-                        crate::require_recovery(
-                            &self.sessions,
-                            self.events.as_deref(),
-                            &self.id,
-                            &turn.id,
-                        );
+                        self.require_recovery(&turn.id);
                         return;
-                    };
-                    connection = loaded;
-                    self.finish(&turn.id, Some(&reason));
+                    }
                 }
             }
         }
-        drop(connection);
-        self.retire();
     }
 }

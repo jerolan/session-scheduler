@@ -41,6 +41,14 @@ Cuando el turno alcance un desenlace confirmado, llama a `archive_session`
 con el `session_id`. La sesión sale de `list_sessions` y sigue disponible
 en `inspect_session` con `archived: true`, su historial y su desenlace.
 
+El registro de sesiones vive en la memoria del proceso. Los IDs devueltos
+permiten listar e inspeccionar las sesiones durante esa ejecución, pero el
+registro se pierde al reiniciar el scheduler. La cola de eventos pendientes se
+conserva por separado y continúa sus reintentos tras el reinicio, con los
+IDs originales. La persistencia del registro de sesiones corresponde a
+[#12](https://github.com/jerolan/session-scheduler/issues/12), posterior al
+alcance actual.
+
 ## Recuperación de un turno interrumpido
 
 Si se pierde la respuesta del turno, el scheduler intenta cargar la sesión
@@ -51,11 +59,19 @@ estado pasa a `unknown` y se registra `turn.recovery_required` con motivo
 `outcome_unknown`. En HTTP, este evento tiene su propia suscripción y usa
 la misma cola persistente que `turn.completed`.
 
-Llama a `reconnect_session` con `session_id` para hacer un intento adicional.
-Si el adaptador confirma el desenlace, `turn.completed` lleva los IDs del
-turno original. Después se puede enviar un encargo explícito con `follow_up`
-en la sesión recuperada. Los intentos de recuperación solo inicializan el
-adaptador y solicitan la carga de la sesión existente.
+Una carga válida conserva la conexión y amplía el historial observado con
+las actualizaciones recuperadas que coinciden con la conversación. Si
+queda disponible la conexión y la sesión está sin un turno activo, una
+llamada explícita a `follow_up` puede iniciar un turno con otro ID, aunque
+el desenlace original siga indeterminado. En ese caso,
+`inspect_session` conserva su ID en `unresolved_turn_ids` y muestra el
+estado y resultado del nuevo turno en los campos habituales.
+
+Llama a `reconnect_session` con `session_id` para hacer un intento adicional
+mientras el último turno esté en `unknown`. Si el adaptador confirma su
+desenlace, `turn.completed` lleva los IDs del turno original. Los intentos
+de recuperación solo inicializan el adaptador y solicitan la carga de la
+sesión existente.
 
 ACP estándar puede recargar la conversación. Para confirmar el desenlace,
 el scheduler requiere que la respuesta de `session/load` incluya

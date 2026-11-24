@@ -119,6 +119,13 @@ class HttpEvents(unittest.TestCase):
                     error, ids = call('delegate', {'workspace': state, 'prompt': prompt})
                     self.assertFalse(error)
                     session = {'session_id': ids['session_id']}
+                    error, sessions = call('list_sessions', {})
+                    self.assertFalse(error)
+                    self.assertEqual([item['session_id'] for item in sessions], [ids['session_id']])
+                    error, current = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual((current['session_id'], current['turn_id']),
+                                     (ids['session_id'], ids['turn_id']))
                     if prompt == 'wait_cancel':
                         prompt_ready = Path(state) / 'prompt-ready'
                         deadline = time.monotonic() + 5
@@ -182,6 +189,8 @@ class HttpEvents(unittest.TestCase):
             with start() as scheduler:
                 try:
                     wait_for_scheduler()
+                    self.assertEqual(call('list_sessions', {}), (False, []))
+                    self.assertEqual(call('inspect_session', session), (True, 'Session not found'))
                     self.assertEqual(next_attempt('after restart'), (503, event_id, subscription_id, event))
                     receiver.recovered.set()
                     status, retried_id, retried_subscription, retried_event = next_attempt('after recovery')
@@ -300,7 +309,7 @@ class HttpEvents(unittest.TestCase):
             self.assertFalse(error)
             expect_event('turn.completed', auto, 'end_turn')
             _, automatic = call('inspect_session', auto)
-            self.assertEqual((automatic['status'], automatic['result']), ('completed', 'pong'))
+            self.assertEqual((automatic['status'], automatic['result']), ('completed', 'pong completo'))
             self.assertEqual(Path(state, 'invocations').read_text(), 'x')
             self.assertFalse(call('archive_session', auto)[0])
             Path(state, 'interrupted.json').unlink()
@@ -311,8 +320,6 @@ class HttpEvents(unittest.TestCase):
             _, unresolved = call('inspect_session', original)
             self.assertEqual((unresolved['status'], unresolved['stop_reason']), ('unknown', None))
             self.assertEqual(json.loads(Path(state, 'interrupted.json').read_text())['loads'], 3)
-            self.assertTrue(call('follow_up', dict(original, prompt='recall'))[0])
-
             self.assertEqual(call('reconnect_session', original),
                              (False, dict(original, status='recovering')))
             for _ in range(100):
@@ -340,6 +347,28 @@ class HttpEvents(unittest.TestCase):
             expect_event('turn.completed', follow_up, 'end_turn')
             _, continued = call('inspect_session', follow_up)
             self.assertEqual(continued['result'], 'pong')
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=1.2)
+
+            Path(state, 'interrupted.json').unlink()
+            Path(state, 'outcome-ready').unlink()
+            error, original = call('delegate', {'workspace': state, 'prompt': 'recover_no_evidence'})
+            self.assertFalse(error)
+            expect_event('turn.recovery_required', original, 'outcome_unknown')
+            _, unresolved = call('inspect_session', original)
+            self.assertEqual((unresolved['status'], unresolved['stop_reason']), ('unknown', None))
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=1.2)
+
+            error, follow_up = call('follow_up', dict(original, prompt='recall'))
+            self.assertFalse(error)
+            self.assertEqual(follow_up['session_id'], original['session_id'])
+            self.assertNotEqual(follow_up['turn_id'], original['turn_id'])
+            expect_event('turn.completed', follow_up, 'end_turn')
+            _, continued = call('inspect_session', follow_up)
+            self.assertEqual((continued['result'], continued['acp_session_id']),
+                             ('pong', unresolved['acp_session_id']))
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
             with self.assertRaises(queue.Empty):
                 receiver.messages.get(timeout=1.2)
 

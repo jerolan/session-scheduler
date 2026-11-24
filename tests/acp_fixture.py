@@ -4,10 +4,16 @@ from pathlib import Path
 session_id = str(uuid.uuid4())
 interrupted = Path('interrupted.json')
 
-def update(text):
-    print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':text}}}}), flush=True)
+def update(text, role='agent', target=None):
+    print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':target or session_id,'update':{'sessionUpdate':f'{role}_message_chunk','content':{'type':'text','text':text}}}}), flush=True)
+
+def tool_update(tool_id, status):
+    print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {
+        'sessionId': session_id, 'update': {'sessionUpdate': 'tool_call',
+            'toolCallId': tool_id, 'status': status, 'rawOutput': 'secret'}}}), flush=True)
 
 memory = None
+remembered_prompt = None
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
@@ -25,7 +31,21 @@ for line in sys.stdin:
         memory = 'pong'
         previous['loads'] += 1
         interrupted.write_text(json.dumps(previous))
-        update('pong')
+        if previous['mode'] == 'recover_no_evidence' and previous['loads'] > 1:
+            sys.exit(1)
+        if previous.get('remembered_prompt'):
+            update(previous['remembered_prompt'], role='user')
+            update('remembered')
+        if previous['mode'] == 'recover_auto':
+            update('recover_', role='user')
+            update('auto', role='user')
+            tool_update('observed-tool', 'completed')
+            update('po')
+            update('ng completo')
+            update('foreign history', target='foreign')
+            tool_update('replayed-tool', 'completed')
+        else:
+            update('pong')
         result = {}
         if previous['mode'] == 'recover_auto':
             session = 'wrong-session' if previous['loads'] == 1 else session_id
@@ -70,7 +90,10 @@ for line in sys.stdin:
                 sys.exit(1)
             Path('invocations').write_text('x')
             interrupted.write_text(json.dumps({
-                'session': session_id, 'request': msg['id'], 'mode': prompt, 'loads': 0}))
+                'session': session_id, 'request': msg['id'], 'mode': prompt, 'loads': 0,
+                'remembered_prompt': remembered_prompt}))
+            if prompt == 'recover_auto':
+                tool_update('observed-tool', 'in_progress')
             update('pong')
             sys.exit(0)
         if prompt == 'disconnect':
@@ -96,6 +119,7 @@ for line in sys.stdin:
                 print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':update}}), flush=True)
         text = 'fixture result'
         if prompt.startswith('remember:'):
+            remembered_prompt = prompt
             memory = prompt.removeprefix('remember:')
             text = 'remembered'
         elif prompt == 'recall':

@@ -222,7 +222,19 @@ try {
     $message = Next-Message; $completion = $message.body | ConvertFrom-Json
     Assert ($message.subscription -eq $id -and $completion.name -eq 'turn.completed' -and $completion.eventId -ne $notice.eventId -and $completion.data.session_id -eq $interrupted.session_id -and $completion.data.turn_id -eq $interrupted.turn_id -and $completion.data.reason -eq 'end_turn') 'Recovered completion IDs did not match'
     $restored = Inspect $interrupted.session_id
-    Assert ($restored.status -eq 'completed' -and $restored.acp_session_id -eq $unresolved.acp_session_id -and ($restored.history.text -join '|') -ceq 'disconnect with pong|pong') 'Recovery did not preserve the ACP session and history'
+    Assert ($restored.status -eq 'completed' -and $restored.acp_session_id -eq $unresolved.acp_session_id -and $restored.result -ceq 'pong completo' -and ($restored.history.text -join '|') -ceq 'disconnect with pong|pong completo') 'Recovery did not reconcile the complete result and history'
+    Remove-Item -LiteralPath (Join-Path $workspace 'outcome-ready'),(Join-Path $workspace 'interrupted.txt')
+    $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt='disconnect with pong'}}
+    Assert (-not $delegation.result.isError) 'Second interrupted turn was rejected'
+    $unknown = $delegation.result.content[0].text | ConvertFrom-Json
+    $message = Next-Message; $notice = $message.body | ConvertFrom-Json
+    Assert ($message.subscription -eq $noticeSubscriptionId -and $notice.name -eq 'turn.recovery_required' -and $notice.data.session_id -eq $unknown.session_id -and $notice.data.turn_id -eq $unknown.turn_id) 'Unknown turn notice IDs did not match'
+    $beforeFollowUp = Inspect $unknown.session_id
+    Assert ($beforeFollowUp.status -eq 'unknown' -and $null -eq $beforeFollowUp.stop_reason) 'Unconfirmed original turn acquired a terminal outcome'
+    $followUp = Check-Turn 'What was the interrupted response?' 'end_turn' $unknown.session_id
+    $afterFollowUp = Inspect $unknown.session_id
+    Assert ($followUp.ids.turn_id -ne $unknown.turn_id -and $afterFollowUp.acp_session_id -eq $beforeFollowUp.acp_session_id -and $afterFollowUp.result -ceq 'pong') 'Explicit follow-up did not reuse loaded context with a new turn'
+    Assert ($unknown.turn_id -in $afterFollowUp.unresolved_turn_ids) 'The original indeterminate turn ID was lost'
     $null = Rpc 'events/unsubscribe' @{name='turn.recovery_required';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Stop-Scheduler
     Start-Scheduler
@@ -256,7 +268,7 @@ try {
     Write-Host 'PASS: Windows authenticated MCP and signed verification'
     Write-Host 'PASS: signed success and confirmed-failure events matched session and turn IDs'
     Write-Host 'PASS: explicit follow-up kept ACP session and context with distinct signed completions'
-    Write-Host 'PASS: recovery notice and explicit reconnection confirmed the original turn'
+    Write-Host 'PASS: recovered history and result matched the original turn; explicit follow-up reused an unconfirmed session'
     Write-Host 'PASS: persisted subscription, atomic replacement, protected ACLs and denied ACP approval'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {

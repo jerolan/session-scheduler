@@ -226,19 +226,64 @@ class Acceptance(unittest.TestCase):
     def test_disconnected_turn_is_unknown_and_never_repeated(self):
         created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':'disconnect'})['content'][0]['text'])
         self.wait_for_status(created, 'unknown')
+        self.assertTrue(self.call('follow_up', dict(created, prompt='recall'))['isError'])
         time.sleep(.2)
         self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+    def test_uncertain_turn_keeps_loaded_context_for_explicit_follow_up(self):
+        self.start_scheduler(opencode_command=FIXTURE)
+        original = self.finish('recover_no_evidence', agent='opencode')
+        self.assertEqual((original['status'], original['stop_reason']), ('unknown', None))
+        ids = {key: original[key] for key in ('session_id', 'turn_id')}
+        # The first load worked, but two later probes and the manual retry fail.
+        self.assertFalse(self.call('reconnect_session', ids)['isError'])
+        self.assertEqual(self.wait_for_status(ids, 'unknown'), original)
+        self.assertEqual(json.loads(Path(self.tmp.name, 'interrupted.json').read_text())['loads'], 4)
+
+        response = self.call('follow_up', dict(ids, prompt='recall'))
+        self.assertFalse(response['isError'], response['content'])
+        follow_up = json.loads(response['content'][0]['text'])
+        self.assertEqual(follow_up['session_id'], ids['session_id'])
+        self.assertNotEqual(follow_up['turn_id'], ids['turn_id'])
+        self.assertTrue(self.call('follow_up', dict(ids, prompt='recall'))['isError'])
+        continued = self.wait_for_status(follow_up, 'completed')
+        self.assertEqual(continued['result'], 'pong')
+        self.assertEqual(continued['acp_session_id'], original['acp_session_id'])
+        self.assertEqual(continued["unresolved_turn_ids"], [ids["turn_id"]])
+        self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+
     def test_recovers_original_turn_only_with_correlated_outcome(self):
         args = {'workspace': self.tmp.name, 'prompt': 'recover_auto'}
         ids = json.loads(self.call('delegate', args)['content'][0]['text'])
         record = self.wait_for_status(ids, 'completed')
         self.assertEqual(record['stop_reason'], 'end_turn')
+        self.assertEqual(record['result'], 'pong completo')
         self.assertEqual(record['history'], [
             {'role': 'user', 'text': 'recover_auto'},
-            {'role': 'agent', 'text': 'pong'},
+            {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'in_progress'},
+            {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'completed'},
+            {'role': 'agent', 'text': 'pong completo'},
+            {'type': 'tool_call', 'tool_call_id': 'replayed-tool', 'status': 'completed'},
         ])
         self.assertEqual(json.loads(Path(self.tmp.name, 'interrupted.json').read_text())['loads'], 3)
         self.assertEqual(Path(self.tmp.name, 'invocations').read_text(), 'x')
+
+    def test_replayed_turns_are_reconciled_without_changing_the_latest_result(self):
+        previous = self.finish('remember:blue plum')
+        args = {'session_id': previous['session_id'], 'prompt': 'recover_auto'}
+        response = self.call('follow_up', args)
+        self.assertFalse(response['isError'], response['content'])
+        ids = json.loads(response['content'][0]['text'])
+        record = self.wait_for_status(ids, 'completed')
+        self.assertEqual(record['result'], 'pong completo')
+        self.assertEqual(record['history'], [
+            {'role': 'user', 'text': 'remember:blue plum'},
+            {'role': 'agent', 'text': 'remembered'},
+            {'role': 'user', 'text': 'recover_auto'},
+            {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'in_progress'},
+            {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'completed'},
+            {'role': 'agent', 'text': 'pong completo'},
+            {'type': 'tool_call', 'tool_call_id': 'replayed-tool', 'status': 'completed'},
+        ])
 
     def test_stalled_recovery_is_bounded_and_keeps_original_turn(self):
         args = {'workspace': self.tmp.name, 'prompt': 'recover_stalled'}

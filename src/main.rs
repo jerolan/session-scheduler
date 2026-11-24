@@ -19,7 +19,7 @@ use uuid::Uuid;
 #[derive(Default)]
 struct ChildRegistry {
     stopping: bool,
-    children: BTreeMap<String, Arc<Mutex<Child>>>,
+    children: BTreeMap<String, Vec<Arc<Mutex<Child>>>>,
 }
 type Children = Arc<Mutex<ChildRegistry>>;
 #[derive(Clone, Copy)]
@@ -113,10 +113,15 @@ fn register_cancel(
         );
     }
 }
-type Workers = Arc<Mutex<BTreeMap<String, mpsc::Sender<Turn>>>>;
+type Workers = Arc<Mutex<BTreeMap<String, mpsc::Sender<Work>>>>;
 struct Turn {
     id: String,
     prompt: String,
+}
+
+enum Work {
+    Prompt(Turn),
+    Reconnect { turn_id: String },
 }
 
 fn result(value: Value, error: bool) -> Value {
@@ -209,12 +214,12 @@ enum Action {
     Start {
         workspace: PathBuf,
         start: Start,
-        receiver: mpsc::Receiver<Turn>,
+        receiver: mpsc::Receiver<Work>,
         workers: Workers,
         children: Children,
         adapter: Adapter,
     },
-    Follow(mpsc::Sender<Turn>, Turn),
+    Send(mpsc::Sender<Work>, Work),
 }
 impl Drop for Launch {
     fn drop(&mut self) {
@@ -259,8 +264,14 @@ fn launch(mut job: Launch) {
             };
             thread::spawn(move || acp.run(start));
         }
-        Action::Follow(sender, turn) => {
-            if sender.send(turn).is_err() {
+        Action::Send(sender, work) => {
+            if let Err(error) = sender.send(work) {
+                if matches!(error.0, Work::Reconnect { .. }) {
+                    update(&job.sessions, &job.id, |record| {
+                        record["status"] = json!("unknown")
+                    });
+                    return;
+                }
                 finish_turn(
                     &job.sessions,
                     job.events.as_deref(),
@@ -288,7 +299,7 @@ impl Drop for State {
     fn drop(&mut self) {
         let mut registry = self.children.lock().unwrap();
         registry.stopping = true;
-        for child in registry.children.values() {
+        for child in registry.children.values().flatten() {
             let _ = child.lock().unwrap().kill();
         }
     }
@@ -414,27 +425,38 @@ impl State {
             return (result(json!("Session is not available"), true), None);
         };
         let turn_id = turn_id.to_owned();
-        let start = Start::Reconnect {
-            acp_id: acp_id.to_owned(),
-            turn_id: turn_id.clone(),
-        };
+        let acp_id = acp_id.to_owned();
         let previous = record.clone();
         record["status"] = json!("recovering");
-        let (sender, receiver) = mpsc::channel();
-        self.workers.lock().unwrap().insert(id.to_owned(), sender);
-        self.cancel_writers
-            .lock()
-            .unwrap()
-            .insert(id.to_owned(), Arc::new(Mutex::new(None)));
-        let job = Launch {
-            action: Some(Action::Start {
-                start,
+        let mut workers = self.workers.lock().unwrap();
+        let action = if let Some(sender) = workers.get(id) {
+            Action::Send(
+                sender.clone(),
+                Work::Reconnect {
+                    turn_id: turn_id.clone(),
+                },
+            )
+        } else {
+            let (sender, receiver) = mpsc::channel();
+            workers.insert(id.to_owned(), sender);
+            self.cancel_writers
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), Arc::new(Mutex::new(None)));
+            Action::Start {
+                start: Start::Reconnect {
+                    acp_id,
+                    turn_id: turn_id.clone(),
+                },
                 workspace,
                 receiver,
                 workers: self.workers.clone(),
                 children: self.children.clone(),
                 adapter: Adapter { kind, executable },
-            }),
+            }
+        };
+        let job = Launch {
+            action: Some(action),
             sessions: self.sessions.clone(),
             id: id.to_owned(),
             turn_id: turn_id.clone(),
@@ -463,10 +485,19 @@ impl State {
         };
         if matches!(
             record["status"].as_str(),
-            Some("running" | "cancelling" | "completion_pending" | "recovering" | "unknown")
+            Some("running" | "cancelling" | "completion_pending" | "recovering")
         ) || record["archived"] == true
         {
             return (result(json!("Session is not available"), true), None);
+        }
+        if record["status"] == "unknown"
+            && !record["workspace"].as_str().is_some_and(|path| {
+                PathBuf::from(path).canonicalize().is_ok_and(|workspace| {
+                    workspace == std::path::Path::new(path) && workspace.is_dir()
+                })
+            })
+        {
+            return (result(json!("Workspace is not allowed"), true), None);
         }
         let Some(sender) = self.workers.lock().unwrap().get(id).cloned() else {
             return (result(json!("Session is not available"), true), None);
@@ -477,14 +508,24 @@ impl State {
             .unwrap()
             .children
             .get(id)
+            .and_then(|children| children.last())
             .map(|child| matches!(child.lock().unwrap().try_wait(), Ok(None)))
             .unwrap_or(false);
         if !usable {
-            self.workers.lock().unwrap().remove(id);
             return (result(json!("Session is not available"), true), None);
         }
         let previous = record.clone();
         let tid = Uuid::new_v4().to_string();
+        if record["status"] == "unknown" {
+            let unresolved = record["turn_id"].clone();
+            if record["unresolved_turn_ids"].is_null() {
+                record["unresolved_turn_ids"] = json!([]);
+            }
+            record["unresolved_turn_ids"]
+                .as_array_mut()
+                .unwrap()
+                .push(unresolved);
+        }
         record["turn_id"] = json!(tid);
         record["status"] = json!("running");
         record["result"] = json!("");
@@ -494,12 +535,12 @@ impl State {
             .unwrap()
             .push(json!({"role":"user","text":prompt}));
         let job = Launch {
-            action: Some(Action::Follow(
+            action: Some(Action::Send(
                 sender,
-                Turn {
+                Work::Prompt(Turn {
                     id: tid.clone(),
                     prompt: prompt.to_owned(),
-                },
+                }),
             )),
             sessions: self.sessions.clone(),
             id: id.to_owned(),
