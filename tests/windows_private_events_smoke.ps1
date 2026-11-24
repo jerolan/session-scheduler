@@ -1,11 +1,28 @@
 # Run with PowerShell 7 on Windows against cross-compiled Windows binaries:
 # pwsh -File tests/windows_private_events_smoke.ps1 -SchedulerExe <path> -FixtureExe <path>
 # Compile tests/acp_fixture_windows.rs as a standalone executable with the same Windows target and linker.
-param([Parameter(Mandatory)][string]$SchedulerExe, [Parameter(Mandatory)][string]$FixtureExe)
+[CmdletBinding(DefaultParameterSetName='Fixture')]
+param(
+    [Parameter(Mandatory)][string]$SchedulerExe,
+    [Parameter(Mandatory, ParameterSetName='Fixture')][string]$FixtureExe,
+    [Parameter(Mandatory, ParameterSetName='OpenCode')][string]$OpenCodeExe,
+    [Parameter(Mandatory, ParameterSetName='OpenCode')][string]$ProxyWorkspace,
+    [Parameter(Mandatory, ParameterSetName='OpenCode')][string]$ReadOnlyPrompt,
+    [Parameter(Mandatory, ParameterSetName='OpenCode')][string]$ExpectedOutput
+)
 $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { throw 'Run this smoke test on Windows.' }
 $SchedulerExe = (Resolve-Path -LiteralPath $SchedulerExe).Path
-$FixtureExe = (Resolve-Path -LiteralPath $FixtureExe).Path
+$useOpenCode = $PSCmdlet.ParameterSetName -eq 'OpenCode'
+if ($useOpenCode) {
+    $OpenCodeExe = (Resolve-Path -LiteralPath $OpenCodeExe).Path
+    $ProxyWorkspace = (Resolve-Path -LiteralPath $ProxyWorkspace).Path
+    if (-not (Test-Path -LiteralPath (Join-Path $ProxyWorkspace 'AGENTS.md') -PathType Leaf)) {
+        throw 'Expected AGENTS.md in the SSH proxy workspace.'
+    }
+} else {
+    $FixtureExe = (Resolve-Path -LiteralPath $FixtureExe).Path
+}
 function Assert($condition, [string]$message) { if (-not $condition) { throw $message } }
 function Free-Port { $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $l.Start(); try { return $l.LocalEndpoint.Port } finally { $l.Stop() } }
 function Rpc([string]$method, $params) {
@@ -38,8 +55,8 @@ function Stop-Scheduler {
     }
     $script:process = $null
 }
-function Next-Message {
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+function Next-Message([int]$timeout = 10) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($timeout)
     do {
         $messages = @(Receive-Job $receiver)
         if ($messages.Count -gt 0) {
@@ -95,11 +112,17 @@ $receiver = Start-Job -ArgumentList $receiverPort,([Convert]::ToBase64String($ke
 }
 $callback = "http://127.0.0.1:$receiverPort/callback"
 $names = 'SESSION_SCHEDULER_HTTP_PORT','SESSION_SCHEDULER_BEARER_TOKEN','SESSION_SCHEDULER_ACCOUNT','SESSION_SCHEDULER_STATE_DIR','SESSION_SCHEDULER_CALLBACK_URL','SESSION_SCHEDULER_CALLBACK_IP','SESSION_SCHEDULER_TEST_LOOPBACK_CALLBACK','SESSION_SCHEDULER_WORKSPACES','SESSION_SCHEDULER_ACP_COMMAND','cOnTrOl_PlAnE_ApI_KeY','OPENAI_ADMIN_KEY','sEsSiOn_ScHeDuLeR_SMOKE_SECRET'
-$old = @{}; foreach ($name in $names) { $old[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+$inherited = @(Get-ChildItem Env: | Where-Object Name -Like 'SESSION_SCHEDULER_*' | ForEach-Object Name)
+$environmentNames = @($names + $inherited + 'SESSION_SCHEDULER_OPENCODE_COMMAND' | Sort-Object -Unique)
+$old = @{}
+foreach ($name in $environmentNames) { $old[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $process = $null
 try {
-    $values = @($port, 'test-token', 'test-account', $state, $callback, '127.0.0.1', '1', $workspace, $FixtureExe, 'hidden', 'hidden', 'hidden')
+    foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+    $allowedWorkspace = if ($useOpenCode) { $ProxyWorkspace } else { $workspace }
+    $values = @($port, 'test-token', 'test-account', $state, $callback, '127.0.0.1', '1', $allowedWorkspace, $FixtureExe, 'hidden', 'hidden', 'hidden')
     for ($i = 0; $i -lt $names.Count; $i++) { [Environment]::SetEnvironmentVariable($names[$i], "$($values[$i])", 'Process') }
+    if ($useOpenCode) { $env:SESSION_SCHEDULER_OPENCODE_COMMAND = $OpenCodeExe }
     $ready = $false
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
@@ -128,6 +151,37 @@ try {
         $ids = $response.result.content[0].text | ConvertFrom-Json
         $message = Next-Message; $event = $message.body | ConvertFrom-Json
         Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.eventId -and $event.data.session_id -eq $ids.session_id -and $event.data.turn_id -eq $ids.turn_id -and $event.data.reason -eq $reason) "Completion mismatch: $($message.body)"
+    }
+    if ($useOpenCode) {
+        $tools = Rpc 'tools/list' @{}
+        $delegate = $tools.result.tools | Where-Object name -eq 'delegate'
+        Assert ('opencode' -in $delegate.inputSchema.properties.agent.enum) 'OpenCode missing from MCP tool discovery'
+        $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{agent='opencode';workspace=$ProxyWorkspace;prompt=$ReadOnlyPrompt}}
+        Assert ($null -eq $delegation.error -and -not $delegation.result.isError) 'OpenCode delegation was rejected'
+        $ids = $delegation.result.content[0].text | ConvertFrom-Json
+        Assert ($ids.session_id -and $ids.turn_id) 'Delegation identifiers are missing'
+        $message = Next-Message 60
+        $event = $message.body | ConvertFrom-Json
+        Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.eventId -and $event.data.session_id -eq $ids.session_id -and $event.data.turn_id -eq $ids.turn_id) 'OpenCode completion IDs did not match'
+        $inspection = Rpc 'tools/call' @{name='inspect_session';arguments=@{session_id=$ids.session_id}}
+        Assert ($null -eq $inspection.error -and -not $inspection.result.isError) 'OpenCode session inspection failed'
+        $session = $inspection.result.content[0].text | ConvertFrom-Json
+        Assert ($session.session_id -eq $ids.session_id -and $session.turn_id -eq $ids.turn_id -and $session.agent -eq 'opencode') 'OpenCode inspection IDs did not match'
+        Assert $session.acp_session_id 'OpenCode did not open an ACP session'
+        $reportedWorkspace = $session.workspace
+        if ($reportedWorkspace.StartsWith('\\?\')) { $reportedWorkspace = $reportedWorkspace.Substring(4) }
+        Assert ($reportedWorkspace -eq $ProxyWorkspace) 'OpenCode session used a different workspace'
+        Assert ($session.status -eq 'completed' -and $session.stop_reason -eq 'end_turn' -and $event.data.reason -eq 'end_turn') "OpenCode did not complete: status=$($session.status) reason=$($event.data.reason)"
+        $completedTool = $session.history | Where-Object { $_.type -eq 'tool_call' -and $_.status -eq 'completed' }
+        Assert $completedTool 'OpenCode did not report a completed tool call'
+        Assert ($session.result.Trim() -ceq $ExpectedOutput) 'OpenCode did not return the expected SSH output'
+        [ordered]@{
+            challenge_verified=$true; signature_verified=$true; agent=$session.agent;
+            session_id=$ids.session_id; turn_id=$ids.turn_id; acp_session_id=$session.acp_session_id;
+            subscription_id=$id; event_id=$event.eventId; name=$event.name; reason=$event.data.reason;
+            status=$session.status; workspace=$reportedWorkspace; result=$session.result.Trim()
+        } | ConvertTo-Json -Compress
+        return
     }
     Check-Turn 'permission' 'end_turn'
     Check-Turn 'error' 'failed'
@@ -169,7 +223,7 @@ try {
     New-Item -ItemType File -Path $stopReceiver -Force | Out-Null
     $null = Wait-Job $receiver -Timeout 8
     Remove-Job $receiver -Force -ErrorAction SilentlyContinue
-    foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $old[$name], 'Process') }
+    foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $old[$name], 'Process') }
     if (Test-Path -LiteralPath $workspace) {
         $directory = Get-Item -LiteralPath $workspace -Force
         $expectedParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')

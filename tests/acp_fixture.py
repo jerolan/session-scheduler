@@ -18,7 +18,7 @@ for line in sys.stdin:
             counter = Path('invocations')
             counter.write_text(counter.read_text() + 'x' if counter.exists() else 'x')
             sys.exit(0)
-        if prompt == 'permission':
+        if prompt in ('permission', 'identify_agent'):
             print(json.dumps({'jsonrpc':'2.0','id':99,'method':'session/request_permission','params':{'sessionId':'fixture-session','toolCall':{'toolCallId':'x','title':'test'},'options':[{'optionId':'allow','name':'Allow','kind':'allow_once'}]}}), flush=True)
             answer = json.loads(sys.stdin.readline())
             if answer.get('result',{}).get('outcome',{}).get('outcome') != 'cancelled': sys.exit(1)
@@ -35,8 +35,16 @@ for line in sys.stdin:
                 {'sessionUpdate':'agent_thought_chunk','content':{'type':'text','text':'hidden reasoning'}},
             ]:
                 print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':update}}), flush=True)
+        text = 'fixture result'
+        if prompt == 'identify_agent':
+            if sys.argv[1:] == ['acp']:
+                text = 'opencode fixture result'
+            elif not sys.argv[1:]:
+                text = 'codex fixture result'
+            else:
+                sys.exit(1)
         time.sleep(1)
-        print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'fixture result'}}}}), flush=True)
+        print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':text}}}}), flush=True)
         result = {'stopReason': prompt if prompt in ('cancelled','refusal','max_tokens','max_turn_requests','future_reason') else 'end_turn'}
     else: continue
     print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}), flush=True)

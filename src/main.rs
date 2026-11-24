@@ -20,6 +20,24 @@ impl Drop for Agent {
         let _ = self.0.wait();
     }
 }
+#[derive(Clone, Copy)]
+enum AgentKind {
+    Codex,
+    OpenCode,
+}
+impl AgentKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+struct Adapter {
+    kind: AgentKind,
+    executable: PathBuf,
+}
 type Sessions = Arc<Mutex<BTreeMap<String, Value>>>;
 fn result(value: Value, error: bool) -> Value {
     json!({"content":[{"type":"text", "text":value.to_string()}], "isError":error})
@@ -38,12 +56,16 @@ fn run_acp(
     id: String,
     workspace: PathBuf,
     prompt: String,
-    command: PathBuf,
+    adapter: Adapter,
     events: Option<Arc<events::Events>>,
 ) {
     let mut submitted = false;
     let run = || -> io::Result<()> {
-        let mut agent_command = Command::new(command);
+        let mut agent_command = Command::new(adapter.executable);
+        match adapter.kind {
+            AgentKind::Codex => agent_command.env("INITIAL_AGENT_MODE", "read-only"),
+            AgentKind::OpenCode => agent_command.arg("acp"),
+        };
         for (key, _) in env::vars_os() {
             // Windows environment keys are case-insensitive.
             let name = key.to_string_lossy().to_ascii_uppercase();
@@ -57,7 +79,6 @@ fn run_acp(
         let mut child = Agent(
             agent_command
                 .current_dir(&workspace)
-                .env("INITIAL_AGENT_MODE", "read-only")
                 .env_remove("CODEX_CONFIG")
                 .env_remove("APP_SERVER_LOGS")
                 .stdin(Stdio::piped())
@@ -215,16 +236,17 @@ type Launch = (
     String,
     PathBuf,
     String,
-    PathBuf,
+    Adapter,
     Option<Arc<events::Events>>,
 );
 fn launch(job: Launch) {
-    let (shared, id, workspace, prompt, command, events) = job;
-    thread::spawn(move || run_acp(shared, id, workspace, prompt, command, events));
+    let (shared, id, workspace, prompt, adapter, events) = job;
+    thread::spawn(move || run_acp(shared, id, workspace, prompt, adapter, events));
 }
 struct State {
     allowed: Vec<PathBuf>,
-    command: Option<PathBuf>,
+    codex_command: Option<PathBuf>,
+    opencode_command: Option<PathBuf>,
     sessions: Sessions,
     events: Option<Arc<events::Events>>,
 }
@@ -238,15 +260,57 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
-        let command = env::var_os("SESSION_SCHEDULER_ACP_COMMAND")
-            .map(PathBuf::from)
-            .and_then(|p| p.canonicalize().ok());
+        let executable =
+            |name| env::var_os(name).and_then(|p| PathBuf::from(p).canonicalize().ok());
         Self {
             allowed,
-            command,
+            codex_command: executable("SESSION_SCHEDULER_ACP_COMMAND"),
+            opencode_command: executable("SESSION_SCHEDULER_OPENCODE_COMMAND"),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             events,
         }
+    }
+    fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
+        let Some(workspace) = args["workspace"]
+            .as_str()
+            .and_then(|p| PathBuf::from(p).canonicalize().ok())
+            .filter(|p| self.allowed.contains(p))
+        else {
+            return (result(json!("Workspace is not allowed"), true), None);
+        };
+        let (kind, executable) = match args.get("agent") {
+            None => (AgentKind::Codex, &self.codex_command),
+            Some(agent) if agent == "codex" => (AgentKind::Codex, &self.codex_command),
+            Some(agent) if agent == "opencode" => (AgentKind::OpenCode, &self.opencode_command),
+            Some(_) => return (result(json!("Unknown agent"), true), None),
+        };
+        let (Some(executable), Some(prompt)) = (
+            executable.clone(),
+            args["prompt"].as_str().filter(|p| !p.is_empty()),
+        ) else {
+            return (result(json!("Adapter or prompt unavailable"), true), None);
+        };
+
+        let sid = Uuid::new_v4().to_string();
+        let tid = Uuid::new_v4().to_string();
+        let record = json!({
+            "session_id":sid, "turn_id":tid, "workspace":workspace, "agent":kind.name(),
+            "status":"running", "result":"", "history":[{"role":"user","text":prompt}],
+            "acp_session_id":null, "stop_reason":null
+        });
+        self.sessions.lock().unwrap().insert(sid.clone(), record);
+        let job = (
+            self.sessions.clone(),
+            sid.clone(),
+            workspace,
+            prompt.to_owned(),
+            Adapter { kind, executable },
+            self.events.clone(),
+        );
+        (
+            result(json!({"session_id":sid,"turn_id":tid}), false),
+            Some(job),
+        )
     }
     fn dispatch(&self, request: Value) -> (Option<Value>, Option<Launch>) {
         let Some(id) = request.get("id") else {
@@ -264,8 +328,6 @@ impl State {
                 );
             }
         }
-        let allowed = &self.allowed;
-        let command = &self.command;
         let sessions = &self.sessions;
         let mut launch = None;
         let response = match method {
@@ -284,7 +346,19 @@ impl State {
             }
             "ping" => json!({}),
             "tools/list" => {
-                json!({"tools":[{"name":"delegate","description":"Delegate work to Codex","inputSchema":{"type":"object","properties":{"workspace":{"type":"string"},"prompt":{"type":"string"}},"required":["workspace","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
+                json!({"tools":[{
+                    "name":"delegate",
+                    "description":"Delegate work to Codex or OpenCode",
+                    "inputSchema":{
+                        "type":"object",
+                        "properties":{
+                            "workspace":{"type":"string"},
+                            "prompt":{"type":"string"},
+                            "agent":{"type":"string","enum":["codex","opencode"],"default":"codex"}
+                        },
+                        "required":["workspace","prompt"]
+                    }
+                },{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
             }
             "tools/call" => {
                 let args = &request["params"]["arguments"];
@@ -306,28 +380,9 @@ impl State {
                         None => result(json!("Session not found"), true),
                     },
                     "delegate" => {
-                        let path = args["workspace"]
-                            .as_str()
-                            .and_then(|p| PathBuf::from(p).canonicalize().ok());
-                        if !path.as_ref().is_some_and(|p| allowed.contains(p)) {
-                            result(json!("Workspace is not allowed"), true)
-                        } else if let (Some(command), Some(prompt)) = (
-                            command.clone(),
-                            args["prompt"].as_str().filter(|p| !p.is_empty()),
-                        ) {
-                            let workspace = path.unwrap();
-                            let sid = Uuid::new_v4().to_string();
-                            let tid = Uuid::new_v4().to_string();
-                            let record = json!({"session_id":sid,"turn_id":tid,"workspace":workspace,"status":"running","result":"","history":[{"role":"user","text":prompt}],"acp_session_id":null,"stop_reason":null});
-                            sessions.lock().unwrap().insert(sid.clone(), record);
-                            let shared = Arc::clone(sessions);
-                            let worker_id = sid.clone();
-                            let prompt = prompt.to_owned();
-                            launch = Some((shared, worker_id, workspace, prompt, command));
-                            result(json!({"session_id":sid,"turn_id":tid}), false)
-                        } else {
-                            result(json!("Adapter or prompt unavailable"), true)
-                        }
+                        let (response, job) = self.delegate(args);
+                        launch = job;
+                        response
                     }
                     _ => result(json!("Unknown tool"), true),
                 }
@@ -341,12 +396,9 @@ impl State {
                 );
             }
         };
-        let job = launch.map(|(shared, id, workspace, prompt, command)| {
-            (shared, id, workspace, prompt, command, self.events.clone())
-        });
         (
             Some(json!({"jsonrpc":"2.0","id":id,"result":response})),
-            job,
+            launch,
         )
     }
 }

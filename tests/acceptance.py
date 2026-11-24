@@ -6,12 +6,28 @@ FIXTURE = str(Path(__file__).resolve().parent / 'acp_fixture.py')
 class Acceptance(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.p = None
+
+    def start_scheduler(self, *, opencode_command=None):
         env = dict(os.environ, SESSION_SCHEDULER_WORKSPACES=self.tmp.name, SESSION_SCHEDULER_ACP_COMMAND=FIXTURE, SESSION_SCHEDULER_BEARER_TOKEN='secret', SESSION_SCHEDULER_CALLBACK_URL='secret', SESSION_SCHEDULER_ACCOUNT='secret', SESSION_SCHEDULER_STATE_DIR='secret')
+        if opencode_command is None:
+            env.pop('SESSION_SCHEDULER_OPENCODE_COMMAND', None)
+        else:
+            env['SESSION_SCHEDULER_OPENCODE_COMMAND'] = opencode_command
         self.p = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
         self.n = 0
-    def tearDown(self):
-        self.p.kill(); self.p.wait(); self.p.stdin.close(); self.p.stdout.close(); self.tmp.cleanup()
+        self.addCleanup(self.stop_scheduler)
+
+    def stop_scheduler(self):
+        self.p.kill()
+        self.p.wait()
+        self.p.stdin.close()
+        self.p.stdout.close()
+
     def call(self, name, args):
+        if self.p is None:
+            self.start_scheduler()
         self.n += 1
         self.p.stdin.write(json.dumps({'jsonrpc':'2.0','id':self.n,'method':'tools/call','params':{'name':name,'arguments':args}})+'\n'); self.p.stdin.flush()
         response = json.loads(self.p.stdout.readline())
@@ -42,8 +58,36 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(current['result'], 'fixture result')
         self.assertNotIn('foreign secret', json.dumps(current['history']))
 
-    def finish(self, prompt):
-        created = json.loads(self.call('delegate', {'workspace':self.tmp.name, 'prompt':prompt})['content'][0]['text'])
+    def test_delegate_selects_opencode_and_defaults_to_codex(self):
+        self.start_scheduler(opencode_command=FIXTURE)
+        for selection, expected in [
+            ({'agent': 'opencode'}, 'opencode'),
+            ({'agent': 'codex'}, 'codex'),
+            ({}, 'codex'),
+        ]:
+            with self.subTest(selection=selection):
+                current = self.finish('identify_agent', **selection)
+                self.assertEqual(current['status'], 'completed')
+                self.assertEqual(current['result'], f'{expected} fixture result')
+                self.assertEqual(current['agent'], expected)
+
+    def test_rejects_invalid_agent_selection(self):
+        for agent in ('unknown', None, 1):
+            with self.subTest(agent=agent):
+                response = self.call('delegate', {'workspace':self.tmp.name, 'prompt':'hello', 'agent':agent})
+                self.assertTrue(response['isError'])
+        self.assertEqual(json.loads(self.call('list_sessions', {})['content'][0]['text']), [])
+
+    def test_unconfigured_opencode_does_not_fall_back(self):
+        response = self.call('delegate', {'workspace':self.tmp.name, 'prompt':'hello', 'agent':'opencode'})
+        self.assertTrue(response['isError'])
+        self.assertEqual(json.loads(self.call('list_sessions', {})['content'][0]['text']), [])
+        self.assertEqual(self.finish('identify_agent')['result'], 'codex fixture result')
+
+    def finish(self, prompt, **selection):
+        response = self.call('delegate', {'workspace':self.tmp.name, 'prompt':prompt, **selection})
+        self.assertFalse(response['isError'], response['content'])
+        created = json.loads(response['content'][0]['text'])
         for _ in range(50):
             current = json.loads(self.call('inspect_session', {'session_id':created['session_id']})['content'][0]['text'])
             if current['status'] != 'running': return current
@@ -68,6 +112,7 @@ class Acceptance(unittest.TestCase):
                 self.assertEqual((current['stop_reason'], current['status']), (reason, status))
 
     def test_mcp_initialize_ping_and_list_summaries(self):
+        self.start_scheduler()
         for version in ['2025-11-25', '2025-03-26', 'unknown']:
             self.n += 1
             self.p.stdin.write(json.dumps({'jsonrpc':'2.0','id':self.n,'method':'initialize','params':{'protocolVersion':version}})+'\n'); self.p.stdin.flush()

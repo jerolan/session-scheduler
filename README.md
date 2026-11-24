@@ -1,7 +1,23 @@
 # Session Scheduler
 
-Session Scheduler delega turnos a Codex CLI mediante ACP y ofrece el evento
+Session Scheduler delega turnos a Codex CLI y OpenCode mediante ACP y ofrece el evento
 `turn.completed` para avisar a Dot cuando el turno tiene un desenlace confirmado.
+
+## Selección de agente por MCP
+
+La herramienta `delegate` recibe `workspace`, `prompt` y el campo opcional
+`agent`. Usa `"agent": "opencode"` para elegir OpenCode. Al enviar
+`"agent": "codex"` u omitir el campo, el scheduler usa Codex CLI.
+`inspect_session` incluye el agente elegido y el ID de sesión ACP cuando se
+ha abierto.
+
+Configura `SESSION_SCHEDULER_OPENCODE_COMMAND` en el proceso del scheduler
+con la ruta al ejecutable de OpenCode. El scheduler le pasa el argumento
+`acp` y abre la sesión en el workspace autorizado por
+`SESSION_SCHEDULER_WORKSPACES`. OpenCode usa la política de permisos
+del entorno que lo ejecuta. El scheduler cancela las solicitudes ACP de
+permiso interactivo de ambos agentes. Codex sigue usando
+`SESSION_SCHEDULER_ACP_COMMAND`.
 
 ## Registro local en Codex Desktop
 
@@ -44,3 +60,15 @@ verificación de extremo a extremo. [MCP Events](https://developers.openai.com/p
 Usa [`verify-session-scheduler`](.agents/skills/verify-session-scheduler/SKILL.md)
 para revisar el entorno sin cambios, ejecutar las pruebas existentes y, con
 autorización, comprobar la suscripción y la entrega a Dot.
+
+Para verificar OpenCode desde Windows, ejecuta la prueba con el binario de
+desarrollo del scheduler y un perfil temporal de OpenCode con permisos
+limitados al encargo de lectura. El receptor de loopback verifica el
+challenge y la firma, y coteja los IDs de `turn.completed` con MCP.
+
+```powershell
+pwsh -NoProfile -File tests/windows_private_events_smoke.ps1 `
+  -SchedulerExe $schedulerExe -OpenCodeExe $openCodeExe `
+  -ProxyWorkspace $proxyWorkspace -ReadOnlyPrompt $prompt `
+  -ExpectedOutput $expectedOutput
+```
