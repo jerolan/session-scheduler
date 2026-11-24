@@ -133,6 +133,43 @@ fn update(sessions: &Sessions, id: &str, f: impl FnOnce(&mut Value)) {
         f(session);
     }
 }
+fn finish_turn(
+    sessions: &Sessions,
+    events: Option<&events::Events>,
+    id: &str,
+    turn_id: &str,
+    status: &'static str,
+    stop_reason: Option<&str>,
+    event_reason: &str,
+) {
+    if events.is_some() {
+        update(sessions, id, |record| {
+            record["status"] = json!("completion_pending")
+        });
+    }
+    let publish = {
+        let sessions = sessions.clone();
+        let id = id.to_owned();
+        let turn_id = turn_id.to_owned();
+        let stop_reason = json!(stop_reason);
+        move || {
+            update(&sessions, &id, |record| {
+                if record["turn_id"] == turn_id {
+                    record["status"] = json!(status);
+                    record["stop_reason"] = stop_reason;
+                }
+            });
+        }
+    };
+    if let Some(events) = events {
+        if let Err(error) = events.complete(id, turn_id, event_reason, publish) {
+            eprintln!("could not persist completion of turn {turn_id}: {error}");
+        }
+    } else {
+        publish();
+    }
+}
+
 fn send(writer: &mut impl Write, value: Value) -> io::Result<()> {
     writeln!(writer, "{value}")?;
     writer.flush()
@@ -322,29 +359,21 @@ fn run_acp(job: AcpJob) {
                         "cancelled" => "cancelled",
                         _ => "failed",
                     };
-                    {
-                        let mut slot = cancel_slot.lock().unwrap();
-                        let mut records = sessions.lock().unwrap();
-                        *slot = None;
-                        if let Some(s) = records.get_mut(&id) {
-                            s["status"] = json!(status);
-                            s["stop_reason"] = json!(reason);
-                        }
-                    }
-                    if let Some(events) = &events {
-                        let event_reason = match reason {
-                            "end_turn" | "cancelled" | "refusal" | "max_tokens"
-                            | "max_turn_requests" => reason,
-                            _ => "failed",
-                        }
-                        .to_owned();
-                        let events = events.clone();
-                        let session_id = id.clone();
-                        let turn_id = turn.id.clone();
-                        thread::spawn(move || {
-                            events.complete(&session_id, &turn_id, &event_reason)
-                        });
-                    }
+                    let event_reason = match reason {
+                        "end_turn" | "cancelled" | "refusal" | "max_tokens"
+                        | "max_turn_requests" => reason,
+                        _ => "failed",
+                    };
+                    finish_turn(
+                        &sessions,
+                        events.as_deref(),
+                        &id,
+                        &turn.id,
+                        status,
+                        Some(reason),
+                        event_reason,
+                    );
+                    *cancel_slot.lock().unwrap() = None;
                     turn = loop {
                         match receiver.recv_timeout(Duration::from_millis(100)) {
                             Ok(turn) => break turn,
@@ -397,20 +426,26 @@ fn run_acp(job: AcpJob) {
     }
     cancel_writers.lock().unwrap().remove(&id);
     if outcome.is_err() {
-        let mut slot = cancel_slot.lock().unwrap();
-        *slot = None;
+        *cancel_slot.lock().unwrap() = None;
         let mut records = sessions.lock().unwrap();
         if let Some(workers) = workers.upgrade() {
             workers.lock().unwrap().remove(&id);
         }
-        if let Some(record) = records.get_mut(&id) {
-            record["status"] = json!(if submitted { "unknown" } else { "failed" });
-        }
-        drop(records);
-        if !submitted {
-            if let Some(events) = events {
-                events.complete(&id, &turn.id, "failed");
+        if submitted {
+            if let Some(record) = records.get_mut(&id) {
+                record["status"] = json!("unknown");
             }
+        } else {
+            drop(records);
+            finish_turn(
+                &sessions,
+                events.as_deref(),
+                &id,
+                &turn.id,
+                "failed",
+                None,
+                "failed",
+            );
         }
     }
 }
@@ -480,10 +515,15 @@ fn launch(mut job: Launch) {
         }
         Action::Follow(sender, turn) => {
             if sender.send(turn).is_err() {
-                update(&job.sessions, &job.id, |s| s["status"] = json!("failed"));
-                if let Some(events) = &job.events {
-                    events.complete(&job.id, &job.turn_id, "failed");
-                }
+                finish_turn(
+                    &job.sessions,
+                    job.events.as_deref(),
+                    &job.id,
+                    &job.turn_id,
+                    "failed",
+                    None,
+                    "failed",
+                );
             }
         }
     }
@@ -600,10 +640,10 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if record["status"] == "running"
-            || record["status"] == "cancelling"
-            || record["status"] == "unknown"
-            || record["archived"] == true
+        if matches!(
+            record["status"].as_str(),
+            Some("running" | "cancelling" | "completion_pending" | "unknown")
+        ) || record["archived"] == true
         {
             return (result(json!("Session is not available"), true), None);
         }

@@ -1,4 +1,5 @@
 import base64, hashlib, hmac, http.client, json, os, queue, socket, subprocess, tempfile, threading, time, unittest
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 BIN = str(Path(__file__).resolve().parents[1] / 'target/debug/session-scheduler')
@@ -15,7 +16,173 @@ class Receiver(BaseHTTPRequestHandler):
         response=json.dumps({'challenge': 'wrong' if self.server.wrong else payload.get('challenge')}).encode()
         self.send_response(200); self.send_header('Content-Length',str(len(response))); self.end_headers(); self.wfile.write(response)
     def log_message(self, *args): pass
+class RecoveringReceiver(Receiver):
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if payload.get('type') == 'verification':
+            status = 200
+            response = json.dumps({'challenge': payload['challenge']}).encode()
+        else:
+            status = 200 if self.server.recovered.is_set() else 503
+            response = b''
+        self.send_response(status)
+        self.send_header('Content-Length', str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+        if payload.get('type') != 'verification':
+            self.server.attempts.put((status, self.headers['webhook-id'],
+                                      self.headers['X-MCP-Subscription-Id'], payload))
+
+
 class HttpEvents(unittest.TestCase):
+    def test_completion_waits_for_storage_and_survives_scheduler_restart(self):
+        for prompt, final_status, reason in (
+            ('pong', 'completed', 'end_turn'),
+            ('wait_cancel', 'cancelled', 'cancelled'),
+        ):
+            with self.subTest(reason=reason):
+                self.check_durable_completion(prompt, final_status, reason)
+
+    def check_durable_completion(self, prompt, final_status, reason):
+        with ExitStack() as cleanup:
+            receiver = cleanup.enter_context(ThreadingHTTPServer(('127.0.0.1', 0), RecoveringReceiver))
+            state = cleanup.enter_context(tempfile.TemporaryDirectory())
+            receiver.attempts = queue.Queue()
+            receiver.recovered = threading.Event()
+            threading.Thread(target=receiver.serve_forever, daemon=True).start()
+            cleanup.callback(receiver.shutdown)
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                port = sock.getsockname()[1]
+            callback = f'http://127.0.0.1:{receiver.server_port}/callback'
+            env = {'PATH': os.defpath}
+            env.update(SESSION_SCHEDULER_HTTP_PORT=str(port),
+                       SESSION_SCHEDULER_BEARER_TOKEN='test-token',
+                       SESSION_SCHEDULER_ACCOUNT='test-account',
+                       SESSION_SCHEDULER_STATE_DIR=state,
+                       SESSION_SCHEDULER_CALLBACK_URL=callback,
+                       SESSION_SCHEDULER_TEST_LOOPBACK_CALLBACK='1',
+                       SESSION_SCHEDULER_WORKSPACES=state,
+                       SESSION_SCHEDULER_ACP_COMMAND=FIXTURE)
+            headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer test-token'}
+
+            def rpc(method, params):
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
+                try:
+                    request = {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}
+                    conn.request('POST', '/mcp', json.dumps(request), headers)
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    return json.loads(response.read())['result']
+                finally:
+                    conn.close()
+
+            def wait_for_scheduler():
+                for _ in range(100):
+                    try:
+                        rpc('ping', {})
+                        return
+                    except OSError:
+                        time.sleep(.05)
+                self.fail('isolated scheduler did not start')
+
+            def next_attempt(phase):
+                try:
+                    return receiver.attempts.get(timeout=5)
+                except queue.Empty:
+                    self.fail(f'receiver did not observe a completion attempt {phase} within 5 seconds')
+
+            log_path = Path(state) / 'scheduler.log'
+            log = cleanup.enter_context(log_path.open('wb'))
+
+            def start():
+                return subprocess.Popen([BIN], env=env, stdout=subprocess.DEVNULL, stderr=log)
+
+            def call(name, arguments):
+                result = rpc('tools/call', {'name': name, 'arguments': arguments})
+                return result['isError'], json.loads(result['content'][0]['text'])
+
+            with start() as scheduler:
+                try:
+                    wait_for_scheduler()
+                    subscription = rpc('events/subscribe', {
+                        'name': 'turn.completed', 'arguments': {},
+                        'delivery': {'mode': 'webhook', 'url': callback, 'secret': SECRET},
+                    })
+                    # A directory at the destination makes the real atomic replacement fail.
+                    pending_path = Path(state) / 'pending-events.json'
+                    pending_path.mkdir()
+                    error, ids = call('delegate', {'workspace': state, 'prompt': prompt})
+                    self.assertFalse(error)
+                    session = {'session_id': ids['session_id']}
+                    if prompt == 'wait_cancel':
+                        prompt_ready = Path(state) / 'prompt-ready'
+                        deadline = time.monotonic() + 5
+                        while not prompt_ready.exists():
+                            if time.monotonic() >= deadline:
+                                self.fail('fixture prompt was not submitted')
+                            time.sleep(.02)
+                        self.assertEqual(call('cancel_turn', ids),
+                                         (False, dict(ids, status='cancelling')))
+                        (Path(state) / 'release-cancel').write_text('go')
+                    diagnostic = f'could not persist completion of turn {ids["turn_id"]}:'
+                    deadline = time.monotonic() + 5
+                    while diagnostic not in log_path.read_text():
+                        if time.monotonic() >= deadline:
+                            self.fail('scheduler did not report the local persistence failure')
+                        time.sleep(.02)
+
+                    error, record = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual((record['status'], record['stop_reason']),
+                                     ('completion_pending', None))
+                    self.assertEqual(call('follow_up', dict(session, prompt='recall')),
+                                     (True, 'Session is not available'))
+                    self.assertEqual(call('archive_session', session),
+                                     (True, 'Session cannot be archived'))
+                    with self.assertRaises(queue.Empty):
+                        receiver.attempts.get(timeout=1.5)
+
+                    pending_path.rmdir()
+                    status, event_id, subscription_id, event = next_attempt('before restart')
+                    error, record = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual((record['status'], record['stop_reason']),
+                                     (final_status, reason))
+                    self.assertEqual([entry['event_id'] for entry in json.loads(pending_path.read_text())],
+                                     [event_id])
+                    self.assertEqual(status, 503)
+                    self.assertEqual(subscription_id, subscription['id'])
+                    self.assertEqual(event['eventId'], event_id)
+                    self.assertEqual(event['name'], 'turn.completed')
+                    self.assertEqual(event['data'], {
+                        'session_id': ids['session_id'], 'turn_id': ids['turn_id'], 'reason': reason,
+                    })
+                    self.assertEqual(call('archive_session', session),
+                                     (False, dict(session, archived=True)))
+                    error, archived = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertTrue(archived['archived'])
+                    self.assertEqual((archived['status'], archived['stop_reason']),
+                                     (final_status, reason))
+                finally:
+                    scheduler.kill()
+            # Any requests already accepted by the old process are excluded from replay.
+            while not receiver.attempts.empty():
+                self.assertEqual(receiver.attempts.get_nowait(), (503, event_id, subscription_id, event))
+            with start() as scheduler:
+                try:
+                    wait_for_scheduler()
+                    self.assertEqual(next_attempt('after restart'), (503, event_id, subscription_id, event))
+                    receiver.recovered.set()
+                    status, retried_id, retried_subscription, retried_event = next_attempt('after recovery')
+                    self.assertEqual((status, retried_id, retried_subscription, retried_event),
+                                     (200, event_id, subscription_id, event))
+                    with self.assertRaises(queue.Empty):
+                        receiver.attempts.get(timeout=1.5)
+                finally:
+                    scheduler.kill()
+
     def test_authenticated_discovery(self):
         with socket.socket() as s:
             s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
