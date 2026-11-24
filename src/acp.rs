@@ -4,7 +4,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     env,
     io::{self, BufRead, BufReader},
     path::PathBuf,
@@ -59,136 +59,118 @@ fn append_history(history: &mut Vec<Value>, entry: Value, new_user_message: bool
     history.push(entry);
 }
 
-struct ToolUpdate<'a> {
-    text_offset: usize,
-    entry: &'a Value,
-}
-
-impl ToolUpdate<'_> {
-    fn stage(&self) -> usize {
-        match self.entry["status"].as_str() {
-            Some("pending") => 0,
-            Some("in_progress") => 1,
-            _ => 2,
-        }
-    }
-}
-
-fn split_turn(entries: &[Value]) -> (String, Vec<ToolUpdate<'_>>) {
+fn position_history(entries: &[Value]) -> (String, Vec<(usize, &Value)>) {
     let mut text = String::new();
-    let mut tools = Vec::new();
-    for entry in entries {
-        if let Some(chunk) = entry["text"].as_str() {
-            text.push_str(chunk);
-        } else if entry["type"] == "tool_call" {
-            tools.push(ToolUpdate {
-                text_offset: text.len(),
-                entry,
-            });
-        }
+    let positioned = entries
+        .iter()
+        .map(|entry| {
+            if let Some(chunk) = entry["text"].as_str() {
+                text.push_str(chunk);
+            }
+            (text.len(), entry)
+        })
+        .collect();
+    (text, positioned)
+}
+
+fn tool_stage(entry: &Value) -> u8 {
+    match entry["status"].as_str() {
+        Some("pending") => 0,
+        Some("in_progress") => 1,
+        _ => 2,
     }
-    (text, tools)
 }
 
 fn merge_turn(observed: &[Value], replay: &[Value], has_user_boundary: bool) -> Option<Vec<Value>> {
-    let (observed_text, mut observed_tools) = split_turn(observed);
-    let (replayed_text, replayed_tools) = split_turn(replay);
+    let (observed_text, observed) = position_history(observed);
+    let (replayed_text, replayed) = position_history(replay);
     // A load can omit tool updates and join the text chunks they used to separate.
-    let text = if replayed_text.starts_with(&observed_text) {
-        &replayed_text
-    } else if observed_text.starts_with(&replayed_text) {
-        &observed_text
-    } else {
+    if !replayed_text.starts_with(&observed_text) && !observed_text.starts_with(&replayed_text) {
         return None;
-    };
-
-    if !observed_text.is_empty() && replayed_text.len() > observed_text.len() {
-        // Keep a trailing tool after any continuation in the same replayed text
-        // chunk. Tools between already observed text chunks keep their position.
-        let mut offset = 0;
-        for chunk in replay.iter().filter_map(|entry| entry["text"].as_str()) {
-            offset += chunk.len();
-            if offset >= observed_text.len() {
-                for tool in observed_tools
-                    .iter_mut()
-                    .rev()
-                    .take_while(|tool| tool.text_offset == observed_text.len())
-                {
-                    tool.text_offset = offset;
-                }
-                break;
-            }
-        }
-    }
-
-    let mut tools = Vec::new();
-    let mut seen = BTreeSet::new();
-    for tool in observed_tools {
-        let id = tool.entry["tool_call_id"].as_str()?;
-        if seen.insert((id, tool.entry["status"].as_str()?)) {
-            tools.push(tool);
-        }
     }
     if !has_user_boundary
         && (observed_text.is_empty() || replayed_text.is_empty())
-        && !replayed_tools.iter().any(|tool| {
-            tools
-                .iter()
-                .any(|observed| observed.entry["tool_call_id"] == tool.entry["tool_call_id"])
+        && !replayed.iter().any(|(_, entry)| {
+            entry["tool_call_id"].as_str().is_some_and(|id| {
+                observed
+                    .iter()
+                    .any(|(_, entry)| entry["tool_call_id"] == id)
+            })
         })
     {
         return None;
     }
 
-    for mut tool in replayed_tools {
-        let id = tool.entry["tool_call_id"].as_str()?;
-        let status = tool.entry["status"].as_str()?;
-        if !seen.insert((id, status)) {
+    // Preserve every observation. Replay can supply newer state for a tool ID,
+    // but it cannot establish which occurrence of an update was observed live.
+    let mut merged: Vec<_> = observed
+        .into_iter()
+        .map(|(offset, entry)| (offset, entry.clone()))
+        .collect();
+    let mut final_tools = BTreeMap::new();
+    for (index, &(offset, entry)) in replayed.iter().enumerate() {
+        if let Some(chunk) = entry["text"].as_str() {
+            if offset > observed_text.len() {
+                let start = offset - chunk.len();
+                let continuation = observed_text.len().saturating_sub(start);
+                let mut position = merged.len();
+                if continuation > 0 {
+                    // Extend the replayed chunk before the tools at its tail.
+                    while position > 0 && merged[position - 1].1["type"] == "tool_call" {
+                        position -= 1;
+                        merged[position].0 = offset;
+                    }
+                }
+                merged.insert(
+                    position,
+                    (
+                        offset,
+                        json!({"role":"agent","text":&chunk[continuation..]}),
+                    ),
+                );
+            }
+        } else if let (Some(id), Some(status)) =
+            (entry["tool_call_id"].as_str(), entry["status"].as_str())
+        {
+            let (latest, terminal, conflicting) =
+                final_tools.entry(id).or_insert((index, None, false));
+            *latest = index;
+            if matches!(status, "completed" | "failed") {
+                *conflicting |= terminal.is_some_and(|previous| previous != status);
+                *terminal = Some(status);
+            }
+        }
+    }
+
+    for (index, (offset, entry)) in replayed.into_iter().enumerate() {
+        let Some(id) = entry["tool_call_id"].as_str() else {
+            continue;
+        };
+        if !matches!(final_tools.get(id), Some((latest, _, false)) if *latest == index) {
             continue;
         }
 
-        // Use the replayed position where possible. A collapsed or partial replay
-        // can put a state on the wrong side of an observed update for the same ID.
-        let mut lower = 0;
-        let mut upper = tools.len();
-        for (index, existing) in tools.iter().enumerate() {
-            if existing.entry["tool_call_id"] != id {
+        // A repeated status is relevant only to the current state of this ID.
+        let last = merged
+            .iter()
+            .rposition(|(_, observed)| observed["tool_call_id"] == id);
+        let after_observations = if let Some(last) = last {
+            if tool_stage(&merged[last].1) >= tool_stage(entry) {
                 continue;
             }
-            match existing.stage().cmp(&tool.stage()) {
-                std::cmp::Ordering::Less => lower = index + 1,
-                std::cmp::Ordering::Greater => upper = upper.min(index),
-                std::cmp::Ordering::Equal => return None,
-            }
-        }
-        if lower > upper {
-            return None;
-        }
-        let index = tools
-            .partition_point(|existing| existing.text_offset <= tool.text_offset)
-            .clamp(lower, upper);
-        if let Some(previous) = index.checked_sub(1).and_then(|index| tools.get(index)) {
-            tool.text_offset = tool.text_offset.max(previous.text_offset);
-        }
-        if let Some(next) = tools.get(index) {
-            tool.text_offset = tool.text_offset.min(next.text_offset);
-        }
-        tools.insert(index, tool);
+            last + 1
+        } else {
+            0
+        };
+        let index = merged
+            .partition_point(|(end, _)| *end <= offset)
+            .max(after_observations);
+        let offset = index
+            .checked_sub(1)
+            .map_or(offset, |previous| offset.max(merged[previous].0));
+        merged.insert(index, (offset, entry.clone()));
     }
-
-    let mut merged = Vec::new();
-    let mut offset = 0;
-    for tool in tools {
-        if offset < tool.text_offset {
-            merged.push(json!({"role":"agent","text":&text[offset..tool.text_offset]}));
-        }
-        merged.push(tool.entry.clone());
-        offset = tool.text_offset;
-    }
-    if offset < text.len() {
-        merged.push(json!({"role":"agent","text":&text[offset..]}));
-    }
-    Some(merged)
+    Some(merged.into_iter().map(|(_, entry)| entry).collect())
 }
 
 fn reconcile_history(record: &mut Value, turn_id: &str, replayed: &[Value]) {

@@ -377,6 +377,85 @@ class HttpEvents(unittest.TestCase):
             with self.assertRaises(queue.Empty):
                 receiver.messages.get(timeout=1.2)
 
+    def test_recovery_preserves_repeated_tool_observations_across_text(self):
+        with self.recovery_mcp() as (state, call, expect_event, receiver):
+            prompt = 'recover_repeated_tool'
+            error, original = call('delegate', {'workspace': state, 'prompt': prompt})
+            self.assertFalse(error)
+            expect_event('turn.recovery_required', original, 'outcome_unknown')
+            expected = [
+                {'role': 'user', 'text': prompt},
+                {'role': 'agent', 'text': 'pong'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+                {'role': 'agent', 'text': ' listo'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'completed'},
+            ]
+            _, before = call('inspect_session', original)
+            self.assertEqual((before['status'], before['result'], before['history']),
+                             ('unknown', 'pong listo', expected))
+            self.assertEqual(json.loads(Path(state, 'interrupted.json').read_text())['loads'], 3)
+            Path(state, 'outcome-ready').touch()
+            self.assertEqual(call('reconnect_session', original),
+                             (False, dict(original, status='recovering')))
+            expect_event('turn.completed', original, 'end_turn')
+            _, after = call('inspect_session', original)
+            self.assertEqual(after, dict(before, status='completed', stop_reason='end_turn'))
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=.3)
+
+    def test_recovery_preserves_observed_subsequence_and_adds_final_tool_states(self):
+        with self.recovery_mcp() as (state, call, expect_event, _):
+            prompt = 'recover_history_multiplicity'
+            error, original = call('delegate', {'workspace': state, 'prompt': prompt})
+            self.assertFalse(error)
+            expect_event('turn.recovery_required', original, 'outcome_unknown')
+            before = call('inspect_session', original)[1]['history']
+            self.assertEqual(before, [
+                {'role': 'user', 'text': prompt},
+                {'role': 'agent', 'text': 'pong'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'completed'},
+                {'role': 'agent', 'text': ' otra'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
+                {'role': 'agent', 'text': ' otra'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+            ])
+
+            Path(state, 'outcome-ready').touch()
+            self.assertFalse(call('reconnect_session', original)[0])
+            expect_event('turn.completed', original, 'end_turn')
+            after = call('inspect_session', original)[1]
+            self.assertEqual(after['result'], 'pong otra otra final')
+            self.assertEqual([entry['text'] for entry in after['history']
+                              if entry.get('role') == 'agent'],
+                             ['pong', ' otra', ' otra', ' final'])
+            remaining = iter(after['history'])
+            for entry in before:
+                self.assertIn(entry, remaining)
+            for tool, statuses in (('A', ['completed', 'in_progress', 'completed']),
+                                   ('B', ['in_progress', 'in_progress', 'failed'])):
+                self.assertEqual([entry['status'] for entry in after['history']
+                                  if entry.get('tool_call_id') == tool], statuses)
+            self.assertEqual(len(after['history']), len(before) + 3)
+            self.assertEqual(Path(state, 'invocations').read_text(), 'x')
+
+    def test_recovery_does_not_treat_conflicting_or_obsolete_tool_status_as_final(self):
+        with self.recovery_mcp() as (state, call, expect_event, _):
+            prompt = 'recover_conflicting_tools'
+            error, original = call('delegate', {'workspace': state, 'prompt': prompt})
+            self.assertFalse(error)
+            expect_event('turn.completed', original, 'end_turn')
+            record = call('inspect_session', original)[1]
+            self.assertEqual(record['history'], [
+                {'role': 'user', 'text': prompt},
+                {'role': 'agent', 'text': 'pong'},
+                {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
+                {'type': 'tool_call', 'tool_call_id': 'C', 'status': 'completed'},
+            ])
+
     def test_recovery_merges_interleaved_tool_updates(self):
         with self.recovery_mcp() as (state, call, expect_event, _):
             prompt = 'recover_interleaved_tools'
@@ -387,7 +466,8 @@ class HttpEvents(unittest.TestCase):
             self.assertEqual((record['status'], record['result'], record['history']), (
                 'completed', 'pong completo', [
                     {'role': 'user', 'text': prompt},
-                    {'role': 'agent', 'text': 'pong completo'},
+                    {'role': 'agent', 'text': 'pong'},
+                    {'role': 'agent', 'text': ' completo'},
                     {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'in_progress'},
                     {'type': 'tool_call', 'tool_call_id': 'B', 'status': 'in_progress'},
                     {'type': 'tool_call', 'tool_call_id': 'A', 'status': 'completed'},
@@ -539,7 +619,8 @@ class HttpEvents(unittest.TestCase):
                              ('completed', 'end_turn', 'pong completo'))
             self.assertEqual(resolved['history'], [
                 {'role': 'user', 'text': 'recover_late'},
-                {'role': 'agent', 'text': 'pong completo'},
+                {'role': 'agent', 'text': 'pong'},
+                {'role': 'agent', 'text': ' completo'},
                 {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'in_progress'},
                 {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'completed'},
                 {'role': 'user', 'text': 'explicit follow-up'},

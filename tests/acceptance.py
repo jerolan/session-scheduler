@@ -261,7 +261,8 @@ class Acceptance(unittest.TestCase):
             {'role': 'user', 'text': 'recover_auto'},
             {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'in_progress'},
             {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'completed'},
-            {'role': 'agent', 'text': 'pong completo'},
+            {'role': 'agent', 'text': 'pong'},
+            {'role': 'agent', 'text': ' completo'},
             {'type': 'tool_call', 'tool_call_id': 'replayed-tool', 'status': 'completed'},
         ])
         self.assertEqual(json.loads(Path(self.tmp.name, 'interrupted.json').read_text())['loads'], 3)
@@ -281,7 +282,8 @@ class Acceptance(unittest.TestCase):
             {'role': 'user', 'text': 'recover_auto'},
             {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'in_progress'},
             {'type': 'tool_call', 'tool_call_id': 'observed-tool', 'status': 'completed'},
-            {'role': 'agent', 'text': 'pong completo'},
+            {'role': 'agent', 'text': 'pong'},
+            {'role': 'agent', 'text': ' completo'},
             {'type': 'tool_call', 'tool_call_id': 'replayed-tool', 'status': 'completed'},
         ])
 
@@ -296,7 +298,8 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(recovered['result'], 'pong completo')
         self.assertEqual(recovered['history'], previous['history'] + [
             {'role': 'user', 'text': 'recover_tool_tail'},
-            {'role': 'agent', 'text': 'pong completo'},
+            {'role': 'agent', 'text': 'pong'},
+            {'role': 'agent', 'text': ' completo'},
             {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'in_progress'},
             {'type': 'tool_call', 'tool_call_id': 'tail-tool', 'status': 'completed'},
         ])

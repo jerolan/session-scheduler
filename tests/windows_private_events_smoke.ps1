@@ -222,7 +222,7 @@ try {
     $message = Next-Message; $completion = $message.body | ConvertFrom-Json
     Assert ($message.subscription -eq $id -and $completion.name -eq 'turn.completed' -and $completion.eventId -ne $notice.eventId -and $completion.data.session_id -eq $interrupted.session_id -and $completion.data.turn_id -eq $interrupted.turn_id -and $completion.data.reason -eq 'end_turn') 'Recovered completion IDs did not match'
     $restored = Inspect $interrupted.session_id
-    Assert ($restored.status -eq 'completed' -and $restored.acp_session_id -eq $unresolved.acp_session_id -and $restored.result -ceq 'pong completo' -and ($restored.history.text -join '|') -ceq 'disconnect with pong|pong completo') 'Recovery did not reconcile the complete result and history'
+    Assert ($restored.status -eq 'completed' -and $restored.acp_session_id -eq $unresolved.acp_session_id -and $restored.result -ceq 'pong completo' -and ($restored.history.text -join '|') -ceq 'disconnect with pong|pong| completo') 'Recovery did not reconcile the complete result and history'
     Remove-Item -LiteralPath (Join-Path $workspace 'outcome-ready'),(Join-Path $workspace 'interrupted.txt')
     $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt='disconnect with pong'}}
     Assert (-not $delegation.result.isError) 'Second interrupted turn was rejected'

@@ -47,6 +47,27 @@ for line in sys.stdin:
             tool_update('replayed-tool', 'completed')
         elif previous['mode'] == 'recover_unmarked':
             update('pong completo')
+        elif previous['mode'] == 'recover_repeated_tool':
+            update(previous['mode'], role='user')
+            update('pong listo')
+            tool_update('A', 'completed')
+        elif previous['mode'] == 'recover_history_multiplicity':
+            update(previous['mode'], role='user')
+            update('pong otra otra')
+            if Path('outcome-ready').exists():
+                update(' final')
+                tool_update('B', 'in_progress')
+                tool_update('A', 'completed')
+                tool_update('A', 'completed')
+                tool_update('B', 'failed')
+        elif previous['mode'] == 'recover_conflicting_tools':
+            update(previous['mode'], role='user')
+            update('pong')
+            tool_update('A', 'completed')
+            tool_update('A', 'failed')
+            tool_update('B', 'completed')
+            tool_update('B', 'in_progress')
+            tool_update('C', 'completed')
         elif previous['mode'] == 'recover_interleaved_tools':
             update(previous['mode'], role='user')
             update('pong completo')
@@ -77,11 +98,12 @@ for line in sys.stdin:
             request = 'wrong-turn' if previous['loads'] == 2 else previous['request']
             result['_meta'] = {'session-scheduler/turnOutcome': {
                 'sessionId': session, 'promptRequestId': request, 'stopReason': 'end_turn'}}
-        if previous['mode'] == 'recover_manual' and Path('outcome-ready').exists():
+        if previous['mode'] in ('recover_manual', 'recover_repeated_tool',
+                                'recover_history_multiplicity') and Path('outcome-ready').exists():
             result['_meta'] = {'session-scheduler/turnOutcome': {
                 'sessionId': session_id, 'promptRequestId': previous['request'], 'stopReason': 'end_turn'}}
         if previous['mode'] in ('recover_tool_tail', 'recover_interleaved_tools',
-                                'recover_interleaved_text', 'recover_unmarked') or (
+                                'recover_interleaved_text', 'recover_unmarked', 'recover_conflicting_tools') or (
                 previous['mode'] == 'recover_late' and Path('outcome-ready').exists()):
             mismatch = Path('outcome-ready').read_text() if previous['mode'] == 'recover_late' else ''
             result['_meta'] = {'session-scheduler/turnOutcome': {
@@ -128,6 +150,20 @@ for line in sys.stdin:
             if prompt == 'recover_auto':
                 tool_update('observed-tool', 'in_progress')
             update('pong')
+            if prompt == 'recover_repeated_tool':
+                tool_update('A', 'in_progress')
+                update(' listo')
+                tool_update('A', 'in_progress')
+            if prompt == 'recover_history_multiplicity':
+                tool_update('A', 'completed')
+                update(' otra')
+                tool_update('B', 'in_progress')
+                tool_update('B', 'in_progress')
+                update(' otra')
+                tool_update('A', 'in_progress')
+            if prompt == 'recover_conflicting_tools':
+                tool_update('A', 'in_progress')
+                tool_update('B', 'in_progress')
             if prompt == 'recover_interleaved_tools':
                 tool_update('A', 'in_progress')
                 tool_update('B', 'in_progress')
