@@ -42,6 +42,8 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(events[0]['delivery'], ['webhook'])
                 self.assertEqual(set(events[0]['payloadSchema']['required']), {'session_id','turn_id','reason'})
                 self.assertEqual(post({'jsonrpc':'2.0','method':'notifications/initialized'})[0],202)
+                self.assertEqual(post({'jsonrpc':'2.0','id':3,'method':'ping'}, {'MCP-Protocol-Version':'unsupported'})[0],400)
+                self.assertEqual(post({'jsonrpc':'2.0','id':3,'method':'ping'}, {'MCP-Protocol-Version':'2025-11-25'})[0],200)
                 self.assertEqual(post({'jsonrpc':'2.0','id':3,'method':'ping'}, {'Authorization':'Bearer wrong'})[0],401)
                 self.assertEqual(post({'jsonrpc':'2.0','id':3,'method':'ping'}, {'Origin':'https://evil.example'})[0],403)
                 conn.request('GET','/mcp',headers=headers); r=conn.getresponse(); r.read(); self.assertEqual(r.status,405)
@@ -75,6 +77,8 @@ class HttpEvents(unittest.TestCase):
                 subscribed=rpc('events/subscribe',subscription)['result']['id']
                 challenge, sig, expected, subid=receiver.messages.get(timeout=3)
                 self.assertEqual(challenge['type'],'verification'); self.assertEqual(sig,expected); self.assertEqual(subid,subscribed)
+                self.assertEqual(rpc('events/subscribe',subscription)['result']['id'],subscribed)
+                with self.assertRaises(queue.Empty): receiver.messages.get(timeout=.3)
                 for prompt in ('check_scheduler_environment','error'):
                     result=rpc('tools/call',{'name':'delegate','arguments':{'workspace':state,'prompt':prompt}})['result']
                     ids=json.loads(result['content'][0]['text'])
@@ -92,14 +96,24 @@ class HttpEvents(unittest.TestCase):
                     try: conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5); conn.connect(); break
                     except OSError: time.sleep(.05)
                 else: self.fail('HTTP listener did not restart')
+                self.assertEqual(rpc('events/subscribe',subscription)['result']['id'],subscribed)
+                with self.assertRaises(queue.Empty): receiver.messages.get(timeout=.3)
                 result=rpc('tools/call',{'name':'delegate','arguments':{'workspace':state,'prompt':'error'}})['result']
                 ids=json.loads(result['content'][0]['text'])
                 event,sig,expected,subid=receiver.messages.get(timeout=5)
                 self.assertEqual(sig,expected); self.assertEqual(subid,subscribed); self.assertEqual(event['data']['turn_id'],ids['turn_id'])
+                rotated=json.loads(json.dumps(subscription)); rotated['delivery']['secret']='whsec_'+base64.b64encode(b'abcdefghijklmnopqrstuvwxyz123456').decode()
+                self.assertEqual(rpc('events/subscribe',rotated)['result']['id'],subscribed)
+                challenge,_,_,_=receiver.messages.get(timeout=3)
+                self.assertEqual(challenge['type'],'verification')
                 unsub={'name':'turn.completed','arguments':{},'delivery':{'mode':'webhook','url':callback}}
                 self.assertEqual(rpc('events/unsubscribe',unsub)['result'],{})
                 rpc('tools/call',{'name':'delegate','arguments':{'workspace':state,'prompt':'error'}})
                 with self.assertRaises(queue.Empty): receiver.messages.get(timeout=1.5)
+                short=json.loads(json.dumps(subscription)); short['ttlMs']=100
+                rpc('events/subscribe',short); receiver.messages.get(timeout=3)
+                time.sleep(1.5)
+                self.assertEqual(json.loads((Path(state)/'event-subscriptions.json').read_text()),[])
             finally:
                 conn.close(); p.kill(); p.wait(); receiver.shutdown(); receiver.server_close()
 if __name__ == '__main__': unittest.main()

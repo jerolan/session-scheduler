@@ -30,6 +30,13 @@ pub fn serve() -> io::Result<()> {
         .filter(|s| !s.is_empty() && !s.contains(['\r', '\n']))
         .ok_or_else(|| io::Error::other("missing bearer token"))?;
     let events = Arc::new(Events::from_env()?);
+    let cleanup_events = events.clone();
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(1));
+        if let Err(error) = cleanup_events.cleanup() {
+            eprintln!("event cleanup failed: {error}");
+        }
+    });
     let state = Arc::new(State::new(Some(events)));
     let server = Server::http(("127.0.0.1", port)).map_err(io::Error::other)?;
     for mut request in server.incoming_requests() {
@@ -67,6 +74,12 @@ pub fn serve() -> io::Result<()> {
                     .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
             }) {
                 let _ = request.respond(response(415, String::new()));
+                return;
+            }
+            if header("MCP-Protocol-Version")
+                .is_some_and(|v| !matches!(v.as_str(), "2025-03-26" | "2025-11-25"))
+            {
+                let _ = request.respond(response(400, String::new()));
                 return;
             }
             let mut body = Vec::new();

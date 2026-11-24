@@ -4,12 +4,13 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     sync::Mutex,
     time::Duration,
@@ -21,8 +22,9 @@ type HmacSha256 = Hmac<Sha256>;
 const NAME: &str = "turn.completed";
 const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const ROTATION_SECONDS: i64 = 300;
+const VERIFICATION_SECONDS: i64 = 3600;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Subscription {
     id: String,
     account: String,
@@ -31,6 +33,8 @@ struct Subscription {
     expires: DateTime<Utc>,
     old_secret: Option<String>,
     old_secret_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    verified_at: Option<DateTime<Utc>>,
 }
 
 pub struct Events {
@@ -89,6 +93,14 @@ fn constant_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 impl Events {
+    #[cfg(not(unix))]
+    pub fn from_env() -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private HTTP state requires Unix permissions",
+        ))
+    }
+    #[cfg(unix)]
     pub fn from_env() -> io::Result<Self> {
         let account = env::var("SESSION_SCHEDULER_ACCOUNT").map_err(|_| {
             io::Error::new(
@@ -161,6 +173,7 @@ impl Events {
                 )
             })?;
         }
+        service.cleanup()?;
         Ok(service)
     }
     fn target(&self, raw: &str) -> Result<(Url, IpAddr), ()> {
@@ -191,6 +204,14 @@ impl Events {
         }
         Ok((url, ip))
     }
+    #[cfg(not(unix))]
+    fn persist(&self, _subs: &[Subscription]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private HTTP state requires Unix permissions",
+        ))
+    }
+    #[cfg(unix)]
     fn persist(&self, subs: &[Subscription]) -> io::Result<()> {
         let tmp = self
             .state
@@ -211,6 +232,26 @@ impl Events {
             let _ = fs::remove_file(tmp);
         }
         result
+    }
+    pub fn cleanup(&self) -> io::Result<()> {
+        let mut lock = self
+            .subscriptions
+            .lock()
+            .map_err(|_| io::Error::other("subscription lock poisoned"))?;
+        let now = Utc::now();
+        let mut next = lock.clone();
+        next.retain(|s| s.expires > now);
+        for sub in &mut next {
+            if sub.old_secret_until.is_none_or(|until| until <= now) {
+                sub.old_secret = None;
+                sub.old_secret_until = None;
+            }
+        }
+        if *lock != next {
+            self.persist(&next)?;
+            *lock = next;
+        }
+        Ok(())
     }
     fn id(&self, url: &str) -> String {
         let mut h = Sha256::new();
@@ -311,6 +352,8 @@ impl Events {
             .ok_or_else(invalid)?;
         self.target(url)
             .map_err(|_| callback_error("invalid_url"))?;
+        self.cleanup()
+            .map_err(|_| json!({"code":-32603,"message":"Internal error"}))?;
         let id = self.id(url);
         if method == "events/unsubscribe" {
             let mut lock = self.subscriptions.lock().map_err(|_| invalid())?;
@@ -346,29 +389,51 @@ impl Events {
             expires,
             old_secret: None,
             old_secret_until: None,
+            verified_at: None,
         };
-        let challenge = Uuid::new_v4().to_string();
-        let response = self
-            .send(
-                &sub,
-                &format!("msg_{}", Uuid::new_v4()),
-                &json!({"type":"verification","challenge":challenge}),
-            )
-            .map_err(|reason| {
-                callback_error(if reason == "transient" || reason == "permanent" {
-                    "challenge_failed"
-                } else {
-                    reason
-                })
-            })?;
-        if !response
-            .get("challenge")
-            .and_then(Value::as_str)
-            .is_some_and(|s| constant_eq(s, &challenge))
-        {
-            return Err(callback_error("challenge_failed"));
-        }
         let mut lock = self.subscriptions.lock().map_err(|_| invalid())?;
+        let cached = lock
+            .iter()
+            .find(|s| {
+                s.id == id
+                    && s.account == self.account
+                    && s.url == url
+                    && s.secret == secret
+                    && s.expires > Utc::now()
+                    && s.verified_at.is_some_and(|at| {
+                        at <= Utc::now()
+                            && at + ChronoDuration::seconds(VERIFICATION_SECONDS) > Utc::now()
+                    })
+            })
+            .and_then(|s| s.verified_at);
+        if cached.is_none() {
+            let challenge = Uuid::new_v4().to_string();
+            let response = self
+                .send(
+                    &sub,
+                    &format!("msg_{}", Uuid::new_v4()),
+                    &json!({"type":"verification","challenge":challenge}),
+                )
+                .map_err(|reason| {
+                    callback_error(if reason == "transient" || reason == "permanent" {
+                        "challenge_failed"
+                    } else {
+                        reason
+                    })
+                })?;
+            if !response
+                .get("challenge")
+                .and_then(Value::as_str)
+                .is_some_and(|s| constant_eq(s, &challenge))
+            {
+                return Err(callback_error("challenge_failed"));
+            }
+            sub.verified_at = Some(Utc::now());
+        } else {
+            sub.verified_at = cached;
+        }
+        let expires = Utc::now() + ChronoDuration::milliseconds(ttl);
+        sub.expires = expires;
         let mut next = lock.clone();
         if let Some(old) = next.iter().find(|s| s.id == id && s.expires > Utc::now()) {
             if old.secret != sub.secret {
@@ -385,7 +450,7 @@ impl Events {
             .map_err(|_| json!({"code":-32603,"message":"Internal error"}))?;
         *lock = next;
         Ok(
-            json!({"id":id,"refreshBefore":expires.to_rfc3339_opts(chrono::SecondsFormat::Secs,true),"cursor":null,"truncated":false}),
+            json!({"id":id,"refreshBefore":expires.to_rfc3339_opts(chrono::SecondsFormat::AutoSi,true),"cursor":null,"truncated":false}),
         )
     }
     pub fn complete(&self, session_id: &str, turn_id: &str, reason: &str) {
@@ -411,6 +476,9 @@ impl Events {
         {
             return;
         }
+        if self.cleanup().is_err() {
+            return;
+        }
         let eligible = match self.subscriptions.lock() {
             Ok(lock) => lock
                 .iter()
@@ -423,7 +491,18 @@ impl Events {
             let id = format!("evt_{}", Uuid::new_v4());
             let event = json!({"eventId":id,"name":NAME,"timestamp":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,true),"data":{"session_id":session_id,"turn_id":turn_id,"reason":reason},"cursor":null});
             for attempt in 0..3 {
-                match self.send(sub, &id, &event) {
+                if self.cleanup().is_err() {
+                    break;
+                }
+                let current = match self.subscriptions.lock() {
+                    Ok(lock) => lock
+                        .iter()
+                        .find(|s| s.id == sub.id && s.expires > Utc::now())
+                        .cloned(),
+                    Err(_) => None,
+                };
+                let Some(current) = current else { break };
+                match self.send(&current, &id, &event) {
                     Ok(_) | Err("permanent") | Err("challenge_failed") | Err("invalid_url") => {
                         break
                     }
