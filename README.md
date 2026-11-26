@@ -77,9 +77,11 @@ conversación.
 ## Encargo de seguimiento por MCP
 
 Para un encargo adicional explícito del usuario, llama a `follow_up` con el
-`session_id` devuelto por `delegate` y el nuevo `prompt`. La sesión debe
-seguir conectada y haber terminado el turno anterior. `follow_up` devuelve
-el mismo `session_id` y un nuevo `turn_id`.
+`session_id` y el nuevo `prompt`. La sesión debe estar libre y el workspace
+debe seguir siendo de confianza. Si el proceso se reinició, el Scheduler
+vuelve a comprobar que la sesión nativa está libre antes de enviar el
+encargo en esa misma sesión. `follow_up` devuelve el mismo `session_id` y
+un nuevo `turn_id`.
 
 `inspect_session` conserva el ID de sesión ACP y el historial de la
 conversación. El estado y el resultado corresponden al turno más reciente.
@@ -150,6 +152,35 @@ el scheduler requiere que la respuesta de `session/load` incluya
 (el ID JSON-RPC original de `session/prompt`) y un `stopReason` terminal
 reconocido. El fixture implementa esta evidencia. Un adaptador que solo
 devuelve la recarga estándar deja el desenlace indeterminado.
+
+## Reconciliar una sesión por confirmar
+
+En el MCP HTTP autenticado, llama a `reconcile_session` con el
+`session_id`. Para corregir un turno anterior que figure en
+`unresolved_turn_ids`, incluye su `turn_id`. El Scheduler conserva el
+estado confirmado del turno más reciente. Una sesión importada sin turno
+pasa a `idle` cuando se confirma que está libre.
+
+Al restaurar el registro, el Scheduler aprovecha primero los desenlaces
+confirmados que ya constan en la cola persistente. Para un registro que
+sigue por confirmar, `reconcile_session` consulta el adaptador configurado
+con `session/load` y descarta las actualizaciones de historial de la carga.
+Solo admite evidencia del mismo ID nativo y workspace. La respuesta debe
+incluir `_meta["session-scheduler/sessionState"]` con `sessionId`, `cwd`
+(la ruta de workspace de la solicitud) y `status: "idle"`. El adaptador
+debe verificar el estado actual de la sesión en ese workspace, incluyendo
+cualquier actividad del agente que pueda seguir en curso. La recarga
+estándar de ACP por sí sola no confirma que la sesión esté libre.
+
+Para corregir un turno, el Scheduler incluye su ID en
+`params._meta["session-scheduler/promptRequestId"]`. La respuesta debe
+incluir también el `turnOutcome` correlacionado descrito arriba. Un
+adaptador que desconoce el estado actual o el desenlace deja el registro
+por confirmar. Si hay evidencia, `inspect_session` conserva la fuente
+`acp_session_load`, el ID del turno pertinente y la fecha de la observación.
+La reconciliación omite el envío de prompts y la emisión de eventos. Un
+`follow_up` posterior comprueba la evidencia de nuevo y tiene su propio
+evento de finalización.
 
 ## Registro local en Codex Desktop
 

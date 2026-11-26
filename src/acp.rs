@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     env,
     io::{self, BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{mpsc, Arc, Mutex, Weak},
     thread,
@@ -233,7 +233,15 @@ fn reconcile_history(record: &mut Value, turn_id: &str, replayed: &[Value]) {
 
 pub(super) enum Start {
     New(Turn),
-    Reconnect { acp_id: String, turn_id: String },
+    Reconnect {
+        acp_id: String,
+        turn_id: String,
+    },
+    Resume {
+        connection: Connection,
+        acp_id: String,
+        turn: Turn,
+    },
 }
 
 pub(super) struct AcpJob {
@@ -248,7 +256,7 @@ pub(super) struct AcpJob {
     pub cancel_writers: CancelWriters,
 }
 
-struct Connection {
+pub(super) struct Connection {
     child: Arc<Mutex<Child>>,
     children: Weak<Mutex<ChildRegistry>>,
     id: String,
@@ -346,15 +354,32 @@ impl Connection {
         self.setup(1, "initialize", json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"session-scheduler","version":"0.1.0"}}))
     }
 
-    fn alive(&self) -> bool {
+    pub(super) fn bind(&mut self, id: &str) {
+        let registry = self.children.upgrade().unwrap();
+        let mut registry = registry.lock().unwrap();
+        let children = registry.children.remove(&self.id).unwrap();
+        registry
+            .children
+            .entry(id.to_owned())
+            .or_default()
+            .extend(children);
+        self.id = id.to_owned();
+    }
+
+    pub(super) fn alive(&self) -> bool {
         matches!(self.child.lock().unwrap().try_wait(), Ok(None))
     }
 }
 
-impl AcpJob {
-    fn connect(&self) -> io::Result<Connection> {
-        let mut command = Command::new(&self.adapter.executable);
-        match self.adapter.kind {
+impl Adapter {
+    fn connect(
+        &self,
+        children: &Weak<Mutex<ChildRegistry>>,
+        id: &str,
+        workspace: &Path,
+    ) -> io::Result<Connection> {
+        let mut command = Command::new(&self.executable);
+        match self.kind {
             AgentKind::Codex => command.env("INITIAL_AGENT_MODE", "read-only"),
             AgentKind::OpenCode => command.arg("acp"),
         };
@@ -368,20 +393,18 @@ impl AcpJob {
                 command.env_remove(key);
             }
         }
-        let registry = self
-            .children
+        let registry = children
             .upgrade()
             .ok_or_else(|| io::Error::other("scheduler stopped"))?;
         let mut registry = registry.lock().unwrap();
         if registry.stopping {
             return Err(io::Error::other("scheduler stopped"));
         }
-        let workspace = self.workspace.canonicalize()?;
-        if workspace != self.workspace || !workspace.is_dir() {
+        if workspace.canonicalize()? != workspace || !workspace.is_dir() {
             return Err(io::Error::other("workspace changed"));
         }
         let mut child = command
-            .current_dir(&self.workspace)
+            .current_dir(workspace)
             .env_remove("CODEX_CONFIG")
             .env_remove("APP_SERVER_LOGS")
             .stdin(Stdio::piped())
@@ -401,21 +424,95 @@ impl AcpJob {
         let child = Arc::new(Mutex::new(child));
         registry
             .children
-            .entry(self.id.clone())
+            .entry(id.to_owned())
             .or_default()
             .push(child.clone());
         Ok(Connection {
             child,
-            children: self.children.clone(),
-            id: self.id.clone(),
+            children: children.clone(),
+            id: id.to_owned(),
             input,
             output,
             deadline: None,
         })
     }
 
+    pub(super) fn load(
+        &self,
+        children: &Weak<Mutex<ChildRegistry>>,
+        id: &str,
+        workspace: &Path,
+        acp_id: &str,
+        observed_turn: Option<&str>,
+        mut on_update: impl FnMut(&Value),
+    ) -> io::Result<(Connection, Value)> {
+        let mut connection = self.connect(children, id, workspace)?;
+        let (done, deadline) = mpsc::channel();
+        let child = connection.child.clone();
+        let expires = Instant::now() + RECOVERY_TIMEOUT;
+        connection.deadline = Some(expires);
+        // Terminate the adapter even if the recovery handshake blocks on a write.
+        let watchdog = thread::spawn(move || {
+            if deadline
+                .recv_timeout(expires.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
+                let _ = child.lock().unwrap().kill();
+            }
+        });
+        let evidence = (|| {
+            let initialized = connection.initialize()?;
+            if initialized["agentCapabilities"]["loadSession"] != true {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "ACP session loading is unsupported",
+                ));
+            }
+            let mut params = json!({"sessionId":acp_id,"cwd":workspace,"mcpServers":[]});
+            if let Some(turn) = observed_turn {
+                params["_meta"]["session-scheduler/promptRequestId"] = json!(turn);
+            }
+            connection
+                .send(json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":params}))?;
+            connection
+                .response(&json!(2), |params| {
+                    if params["sessionId"] == acp_id {
+                        on_update(&params["update"]);
+                    }
+                })?
+                .ok_or_else(|| io::Error::other("ACP session load failed"))
+        })();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        connection.deadline = None;
+        if Instant::now() >= expires {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ACP reload timed out",
+            ));
+        }
+        Ok((connection, evidence?))
+    }
+}
+
+pub(super) fn verified_outcome<'a>(
+    loaded: &'a Value,
+    acp_id: &str,
+    turn_id: &str,
+) -> Option<&'a str> {
+    let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
+    outcome["stopReason"].as_str().filter(|reason| {
+        outcome["sessionId"] == acp_id
+            && outcome["promptRequestId"] == turn_id
+            && known_stop_reason(reason)
+    })
+}
+
+impl AcpJob {
     fn open_session(&self) -> io::Result<(Connection, String)> {
-        let mut connection = self.connect()?;
+        let mut connection = self
+            .adapter
+            .connect(&self.children, &self.id, &self.workspace)?;
         connection.initialize()?;
         let session = connection.setup(
             2,
@@ -434,71 +531,28 @@ impl AcpJob {
     }
 
     fn recover(&self, acp_id: &str, turn_id: &str) -> io::Result<(Connection, Option<String>)> {
-        let workspace = self.workspace.canonicalize()?;
-        if workspace != self.workspace || !workspace.is_dir() {
-            return Err(io::Error::other("workspace changed"));
-        }
-        let mut connection = self.connect()?;
-        let (done, deadline) = mpsc::channel();
-        let child = connection.child.clone();
-        let expires = Instant::now() + RECOVERY_TIMEOUT;
-        connection.deadline = Some(expires);
-        // Terminate the adapter even if the recovery handshake blocks on a write.
-        let watchdog = thread::spawn(move || {
-            if deadline
-                .recv_timeout(expires.saturating_duration_since(Instant::now()))
-                .is_err()
-            {
-                let _ = child.lock().unwrap().kill();
-            }
-        });
         let mut history = Vec::new();
         let mut user_message_id = None;
-        let evidence = (|| {
-            let initialized = connection.initialize()?;
-            if initialized["agentCapabilities"]["loadSession"] != true {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "ACP session loading is unsupported",
-                ));
-            }
-            connection.send(json!({"jsonrpc":"2.0","id":2,"method":"session/load",
-                "params":{"sessionId":acp_id,"cwd":workspace,"mcpServers":[]}}))?;
-            connection
-                .response(&json!(2), |params| {
-                    if params["sessionId"] != acp_id {
-                        return;
+        let (connection, loaded) = self.adapter.load(
+            &self.children,
+            &self.id,
+            &self.workspace,
+            acp_id,
+            None,
+            |update| {
+                if let Some(entry) = visible_update(update, true) {
+                    let mut new_user_message = false;
+                    if entry["role"] == "user" {
+                        let message_id = update["messageId"].as_str();
+                        new_user_message =
+                            message_id.is_some() && message_id != user_message_id.as_deref();
+                        user_message_id = message_id.map(str::to_owned);
                     }
-                    let update = &params["update"];
-                    if let Some(entry) = visible_update(update, true) {
-                        let mut new_user_message = false;
-                        if entry["role"] == "user" {
-                            let message_id = update["messageId"].as_str();
-                            new_user_message =
-                                message_id.is_some() && message_id != user_message_id.as_deref();
-                            user_message_id = message_id.map(str::to_owned);
-                        }
-                        append_history(&mut history, entry, new_user_message);
-                    }
-                })?
-                .ok_or_else(|| io::Error::other("ACP session load failed"))
-        })();
-        let _ = done.send(());
-        let _ = watchdog.join();
-        connection.deadline = None;
-        if Instant::now() >= expires {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "ACP reload timed out",
-            ));
-        }
-        let loaded = evidence?;
-        let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
-        let reason = outcome["stopReason"].as_str().filter(|reason| {
-            outcome["sessionId"] == acp_id
-                && outcome["promptRequestId"] == turn_id
-                && known_stop_reason(reason)
-        });
+                    append_history(&mut history, entry, new_user_message);
+                }
+            },
+        )?;
+        let reason = verified_outcome(&loaded, acp_id, turn_id);
         update(&self.sessions, &self.id, |record| {
             if record["turn_id"] == turn_id || reason.is_some() {
                 reconcile_history(record, turn_id, &history);
@@ -632,6 +686,11 @@ impl AcpJob {
                     return;
                 }
             },
+            Start::Resume {
+                connection,
+                acp_id,
+                turn,
+            } => (connection, acp_id, Some(turn)),
             Start::Reconnect { acp_id, turn_id } => match self.recover(&acp_id, &turn_id) {
                 Ok((connection, reason)) => {
                     self.finish_reconnect(&turn_id, reason.as_deref());

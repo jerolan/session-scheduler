@@ -25,6 +25,26 @@ fn main() {
             continue;
         } else if line.contains("\"session/load\"") {
             record_request("load");
+            if let Ok(saved) = std::fs::read_to_string("registry-probe-session") {
+                let (session, original_request) = saved.split_once('\n').unwrap();
+                if line.contains(&format!(r#""sessionId":"{session}""#)) {
+                    session_id = session.to_owned();
+                    let cwd = line
+                        .split_once(r#""cwd":"#)
+                        .unwrap()
+                        .1
+                        .split_once(r#","mcpServers":"#)
+                        .unwrap()
+                        .0;
+                    let status = std::fs::read_to_string("reconciliation-ready")
+                        .unwrap_or_else(|_| "busy".to_owned());
+                    println!(
+                        r#"{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{"session-scheduler/sessionState":{{"sessionId":"{session}","cwd":{cwd},"status":"{status}"}},"session-scheduler/turnOutcome":{{"sessionId":"{session}","promptRequestId":{original_request},"stopReason":"end_turn"}}}}}}}}"#
+                    );
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+            }
             let saved = std::fs::read_to_string("interrupted.txt").unwrap();
             let (session, original_request) = saved.split_once('\n').unwrap();
             assert!(line.contains(&format!(r#""sessionId":"{session}""#)));
@@ -67,6 +87,8 @@ fn main() {
                 r#""error":{"code":-32603,"message":"fixture failure"}"#
             } else {
                 if line.contains("\"registry restart probe\"") {
+                    std::fs::write("registry-probe-session", format!("{session_id}\n{id}"))
+                        .unwrap();
                     std::fs::write("registry-probe-ready", &session_id).unwrap();
                     loop {
                         std::thread::park();

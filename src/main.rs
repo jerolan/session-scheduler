@@ -166,6 +166,40 @@ fn session_has_status(record: &Value, statuses: &[&str]) -> bool {
         })
 }
 
+fn reserve_follow_up(record: &mut Value, prompt: &str) -> String {
+    let tid = Uuid::new_v4().to_string();
+    if record["status"] == "unknown" {
+        let unresolved = record["turn_id"].as_str().unwrap().to_owned();
+        let history_turn_index = record["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["role"] == "user")
+            .count()
+            - 1;
+        record["previous_turns"][&unresolved] = json!({
+            "status": "unknown", "stop_reason": null, "result": record["result"],
+            "history_turn_index": history_turn_index,
+        });
+        if record["unresolved_turn_ids"].is_null() {
+            record["unresolved_turn_ids"] = json!([]);
+        }
+        record["unresolved_turn_ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(unresolved));
+    }
+    record["turn_id"] = json!(tid);
+    record["status"] = json!("running");
+    record["result"] = json!("");
+    record["stop_reason"] = Value::Null;
+    record["history"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","text":prompt}));
+    tid
+}
+
 fn finish_turn(
     sessions: &Sessions,
     events: Option<&events::Events>,
@@ -553,6 +587,143 @@ impl State {
         )
     }
 
+    fn session_adapter(&self, record: &Value) -> Result<Adapter, Value> {
+        let (kind, command) = match record["agent"].as_str() {
+            Some("codex") => (AgentKind::Codex, &self.codex_command),
+            Some("opencode") => (AgentKind::OpenCode, &self.opencode_command),
+            _ => return Err(result(json!("Unknown agent"), true)),
+        };
+        command
+            .clone()
+            .map(|executable| Adapter { kind, executable })
+            .ok_or_else(|| result(json!("Session adapter is unavailable"), true))
+    }
+
+    fn observe_idle(
+        &self,
+        record: &Value,
+        workspace: &Path,
+        adapter: &Adapter,
+        turn_id: Option<&str>,
+    ) -> Result<(acp::Connection, Value), Value> {
+        let unavailable = || result(json!({"status":"idle_evidence_unavailable"}), true);
+        let native_id = record["acp_session_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(unavailable)?;
+        // Use a separate child slot. An observation must not become the session's worker.
+        let (connection, loaded) = adapter
+            .load(
+                &Arc::downgrade(&self.children),
+                &Uuid::new_v4().to_string(),
+                workspace,
+                native_id,
+                turn_id,
+                |_| {},
+            )
+            .map_err(|_| unavailable())?;
+        let observation = &loaded["_meta"]["session-scheduler/sessionState"];
+        if observation["status"] != "idle"
+            || observation["sessionId"] != native_id
+            || observation["cwd"] != record["workspace"]
+        {
+            return Err(unavailable());
+        }
+        Ok((connection, loaded))
+    }
+
+    fn reconcile_session(&self, args: &Value) -> Value {
+        let Some(id) = args["session_id"].as_str() else {
+            return result(json!("Session required"), true);
+        };
+        let unavailable = || result(json!("Session does not require reconciliation"), true);
+        let (original, target, workspace, adapter) = {
+            let trust = self.workspace_trust.lock().unwrap();
+            let sessions = self.sessions.lock().unwrap();
+            let Some(record) = sessions.get(id) else {
+                return unavailable();
+            };
+            let target = match args.get("turn_id") {
+                None => &record["turn_id"],
+                Some(turn) if turn.is_string() => turn,
+                _ => return unavailable(),
+            };
+            let pending = if *target == record["turn_id"] {
+                record["status"] == "pending_confirmation"
+            } else {
+                record["unresolved_turn_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.contains(target))
+            };
+            if !pending || record["archived"] == true || record["restart_blocked"] != true {
+                return unavailable();
+            }
+            let workspace = match self.session_workspace(&trust.decisions, record) {
+                Ok(workspace) => workspace,
+                Err(error) => return error,
+            };
+            let adapter = match self.session_adapter(record) {
+                Ok(adapter) => adapter,
+                Err(error) => return error,
+            };
+            (record.clone(), target.clone(), workspace, adapter)
+        };
+        let loaded = match self.observe_idle(&original, &workspace, &adapter, target.as_str()) {
+            Ok((_, loaded)) => loaded,
+            Err(error) => return error,
+        };
+        let (status, reason) = match target.as_str() {
+            None => ("idle", None),
+            Some(turn_id) => {
+                let Some(reason) = acp::verified_outcome(
+                    &loaded,
+                    original["acp_session_id"].as_str().unwrap(),
+                    turn_id,
+                ) else {
+                    return result(json!({"status":"turn_evidence_unavailable"}), true);
+                };
+                let status = match reason {
+                    "end_turn" => "completed",
+                    "cancelled" => "cancelled",
+                    _ => "failed",
+                };
+                (status, Some(reason))
+            }
+        };
+
+        let trust = self.workspace_trust.lock().unwrap();
+        if let Err(error) = self.session_workspace(&trust.decisions, &original) {
+            return error;
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(record) = sessions.get_mut(id).filter(|record| **record == original) else {
+            return unavailable();
+        };
+        if let Some(ids) = record["unresolved_turn_ids"].as_array_mut() {
+            ids.retain(|turn| turn != &target);
+        }
+        if target == original["turn_id"] {
+            record["status"] = json!(status);
+            record["stop_reason"] = json!(reason);
+        }
+        record["restart_blocked"] = json!(
+            record["status"] == "pending_confirmation"
+                || record["unresolved_turn_ids"]
+                    .as_array()
+                    .is_some_and(|ids| !ids.is_empty())
+        );
+        record["reconciliation"] = json!({
+            "source":"acp_session_load", "turn_id":target, "latest_turn_id":original["turn_id"],
+            "stop_reason":reason,
+            "observed_at":chrono::Utc::now().to_rfc3339(),
+        });
+        result(
+            json!({"session_id":id, "turn_id":target, "status":status,
+                      "reconciliation":record["reconciliation"]}),
+            false,
+        )
+    }
+
     fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
         let Some(workspace) = resolve_workspace(args) else {
             return (result(json!({"status":"invalid_workspace"}), true), None);
@@ -809,6 +980,106 @@ impl State {
             Some(job),
         )
     }
+    fn resume_reconciled(
+        &self,
+        id: &str,
+        prompt: &str,
+        original: Value,
+        workspace: PathBuf,
+    ) -> (Value, Option<Launch>) {
+        let unavailable = || (result(json!("Session is not available"), true), None);
+        // Restore a known-idle outcome only after checking the native session again.
+        if original["restart_blocked"] != false
+            || !matches!(
+                original["status"].as_str(),
+                Some("idle" | "completed" | "cancelled" | "failed")
+            )
+        {
+            return unavailable();
+        }
+        let proof = &original["reconciliation"];
+        let expected = (proof["source"] == "acp_session_load"
+            && proof["latest_turn_id"] == original["turn_id"])
+            .then(|| (proof["turn_id"].as_str(), proof["stop_reason"].as_str()));
+        let observed_turn = expected.and_then(|(turn, _)| turn);
+        let adapter = match self.session_adapter(&original) {
+            Ok(adapter) => adapter,
+            Err(error) => return (error, None),
+        };
+        let (mut connection, loaded) =
+            match self.observe_idle(&original, &workspace, &adapter, observed_turn) {
+                Ok(observation) => observation,
+                Err(error) => return (error, None),
+            };
+        let acp_id = original["acp_session_id"].as_str().unwrap();
+        if let Some((Some(turn), reason)) = expected {
+            if acp::verified_outcome(&loaded, acp_id, turn) != reason {
+                return (
+                    result(json!({"status":"turn_evidence_conflicts"}), true),
+                    None,
+                );
+            }
+        } else if let Some(reason) = original["turn_id"]
+            .as_str()
+            .and_then(|turn| acp::verified_outcome(&loaded, acp_id, turn))
+        {
+            if original["stop_reason"] != reason {
+                return (
+                    result(json!({"status":"turn_evidence_conflicts"}), true),
+                    None,
+                );
+            }
+        }
+
+        let trust = self.workspace_trust.lock().unwrap();
+        if let Err(error) = self.session_workspace(&trust.decisions, &original) {
+            return (error, None);
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(record) = sessions.get_mut(id).filter(|record| **record == original) else {
+            return unavailable();
+        };
+        let mut workers = self.workers.lock().unwrap();
+        if workers.contains_key(id) || !connection.alive() {
+            return unavailable();
+        }
+        let tid = reserve_follow_up(record, prompt);
+        connection.bind(id);
+        let (sender, receiver) = mpsc::channel();
+        workers.insert(id.to_owned(), sender);
+        self.cancel_writers
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), Arc::new(Mutex::new(None)));
+        let job = Launch {
+            action: Some(Action::Start {
+                start: Start::Resume {
+                    connection,
+                    acp_id: acp_id.to_owned(),
+                    turn: Turn {
+                        id: tid.clone(),
+                        prompt: prompt.to_owned(),
+                    },
+                },
+                workspace,
+                receiver,
+                workers: self.workers.clone(),
+                children: self.children.clone(),
+                adapter,
+            }),
+            sessions: self.sessions.clone(),
+            id: id.to_owned(),
+            turn_id: tid.clone(),
+            previous: Some(original),
+            events: self.events.clone(),
+            cancel_writers: self.cancel_writers.clone(),
+        };
+        (
+            result(json!({"session_id":id,"turn_id":tid}), false),
+            Some(job),
+        )
+    }
+
     fn follow_up(&self, args: &Value) -> (Value, Option<Launch>) {
         let (Some(id), Some(prompt)) = (
             args["session_id"].as_str(),
@@ -830,11 +1101,16 @@ impl State {
         {
             return (result(json!("Session is not available"), true), None);
         }
-        if let Err(error) = self.session_workspace(&trust.decisions, record) {
-            return (error, None);
-        }
-        let Some(sender) = self.workers.lock().unwrap().get(id).cloned() else {
-            return (result(json!("Session is not available"), true), None);
+        let workspace = match self.session_workspace(&trust.decisions, record) {
+            Ok(workspace) => workspace,
+            Err(error) => return (error, None),
+        };
+        let sender = self.workers.lock().unwrap().get(id).cloned();
+        let Some(sender) = sender else {
+            let original = record.clone();
+            drop(sessions);
+            drop(trust);
+            return self.resume_reconciled(id, prompt, original, workspace);
         };
         let usable = self
             .children
@@ -849,36 +1125,7 @@ impl State {
             return (result(json!("Session is not available"), true), None);
         }
         let previous = record.clone();
-        let tid = Uuid::new_v4().to_string();
-        if record["status"] == "unknown" {
-            let unresolved = record["turn_id"].as_str().unwrap().to_owned();
-            let history_turn_index = record["history"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|entry| entry["role"] == "user")
-                .count()
-                - 1;
-            record["previous_turns"][&unresolved] = json!({
-                "status": "unknown", "stop_reason": null, "result": record["result"],
-                "history_turn_index": history_turn_index,
-            });
-            if record["unresolved_turn_ids"].is_null() {
-                record["unresolved_turn_ids"] = json!([]);
-            }
-            record["unresolved_turn_ids"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(unresolved));
-        }
-        record["turn_id"] = json!(tid);
-        record["status"] = json!("running");
-        record["result"] = json!("");
-        record["stop_reason"] = Value::Null;
-        record["history"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"user","text":prompt}));
+        let tid = reserve_follow_up(record, prompt);
         let job = Launch {
             action: Some(Action::Send(
                 sender,
@@ -1001,6 +1248,15 @@ impl State {
                 },{"name":"approve_workspace","description":"After the user explicitly approves the exact workspace in this chat, approve and continue the retained attempt. Retry with the same attempt_id if needed.","inputSchema":{"type":"object","properties":{"attempt_id":{"type":"string"}},"required":["attempt_id"]}},{"name":"revoke_workspace","description":"When the user asks to revoke trust, revoke it for the effective workspace. Existing history remains readable and active turns continue.","inputSchema":{"type":"object","properties":{"workspace":{"type":"string","description":"Absolute path to the workspace"}},"required":["workspace"]}},{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]});
                 if self.events.is_some() {
                     catalog["tools"].as_array_mut().unwrap().push(json!({
+                        "name":"reconcile_session",
+                        "description":"Check the configured adapter for verifiable evidence that a pending session is idle. Defaults to the latest turn, or the session if imported without a turn. Supply an earlier unresolved turn ID to correct it without replacing a newer outcome.",
+                        "inputSchema":{
+                            "type":"object",
+                            "properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},
+                            "required":["session_id"]
+                        }
+                    }));
+                    catalog["tools"].as_array_mut().unwrap().push(json!({
                         "name":"import_session",
                         "description":"Register an explicitly supplied Codex or OpenCode native session ID in a trusted workspace without launching the agent. A new reference remains pending confirmation.",
                         "inputSchema":{
@@ -1048,6 +1304,7 @@ impl State {
                     },
                     "approve_workspace" if self.events.is_some() => self.approve_workspace(args),
                     "revoke_workspace" if self.events.is_some() => self.revoke_workspace(args),
+                    "reconcile_session" if self.events.is_some() => self.reconcile_session(args),
                     "import_session" if self.events.is_some() => self.import_session(args),
                     "cancel_turn" => self.cancel_turn(args),
                     "archive_session" => self.archive_session(args),

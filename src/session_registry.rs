@@ -120,7 +120,7 @@ fn load_records(
             .is_some_and(|ids| !ids.is_empty());
         let active = !matches!(
             record["status"].as_str(),
-            Some("completed" | "failed" | "cancelled")
+            Some("completed" | "failed" | "cancelled" | "idle")
         );
         if active {
             record["status"] = json!("pending_confirmation");
@@ -138,7 +138,8 @@ fn registry_metadata(record: &Value) -> Value {
         "workspace": record["workspace"], "agent": record["agent"],
         "acp_session_id": record["acp_session_id"], "status": record["status"],
         "stop_reason": record["stop_reason"].as_str().filter(|reason| known_stop_reason(reason)),
-        "archived": record["archived"], "unresolved_turn_ids": record["unresolved_turn_ids"]
+        "archived": record["archived"], "unresolved_turn_ids": record["unresolved_turn_ids"],
+        "reconciliation": record["reconciliation"]
     })
 }
 fn save_registry(

@@ -327,6 +327,31 @@ try {
     Assert-Restored $activeBefore 'pending_confirmation' $false
     Assert ((Get-Content -LiteralPath $requestsLog -Raw) -ceq $requestsBefore) 'An unconfirmed turn reached ACP after restart'
     Assert (@(Receive-Job $receiver).Count -eq 0) 'Restored execution attempt delivered an event'
+    $reconcileArgs = @{name='reconcile_session';arguments=@{session_id=$activeIds.session_id;turn_id=$activeIds.turn_id}}
+    $busy = Rpc 'tools/call' $reconcileArgs
+    Assert ($busy.result.isError -and (Inspect $activeIds.session_id).status -ceq 'pending_confirmation') 'Busy observation overrode pending confirmation'
+    $archiveCorrection = Rpc 'tools/call' @{name='reconcile_session';arguments=@{session_id=$archivedBefore.session_id;turn_id=$archivedBefore.turn_id}}
+    Assert ($archiveCorrection.result.isError -and (Inspect $archivedBefore.session_id).archived) 'Reconciliation changed archived identity'
+    [IO.File]::WriteAllText((Join-Path $workspace 'reconciliation-ready'), 'idle')
+    $correction = Rpc 'tools/call' $reconcileArgs
+    $corrected = Inspect $activeIds.session_id
+    Assert (-not $correction.result.isError -and $corrected.status -ceq 'completed' -and $corrected.acp_session_id -ceq $activeBefore.acp_session_id) 'Reconciliation failed to confirm original native session'
+    Assert ($corrected.reconciliation.source -ceq 'acp_session_load' -and $corrected.reconciliation.turn_id -ceq $activeIds.turn_id -and @($corrected.history).Count -eq 0) 'Reconciliation lost provenance or loaded agent history'
+    Start-Sleep -Milliseconds 1200
+    Assert (@(Receive-Job $receiver).Count -eq 0) 'Reconciliation emitted a completion event'
+    $next = Rpc 'tools/call' @{name='follow_up';arguments=@{session_id=$activeIds.session_id;prompt='fresh registry follow-up'}}
+    $nextIds = $next.result.content[0].text | ConvertFrom-Json
+    Assert (-not $next.result.isError -and $nextIds.session_id -ceq $activeIds.session_id -and $nextIds.turn_id -and $nextIds.turn_id -cne $activeIds.turn_id) 'Reconciled session rejected the explicit new turn'
+    $message = Next-Message; $event = $message.body | ConvertFrom-Json
+    Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.data.session_id -eq $nextIds.session_id -and $event.data.turn_id -eq $nextIds.turn_id -and $event.data.reason -eq 'end_turn') 'Fresh turn did not emit its own signed completion'
+    $continued = Inspect $activeIds.session_id
+    Assert ($continued.acp_session_id -ceq $activeBefore.acp_session_id -and $continued.turn_id -ceq $nextIds.turn_id) 'Continuation changed the native ID'
+    $stale = Rpc 'tools/call' $reconcileArgs
+    Assert ($stale.result.isError -and (Inspect $activeIds.session_id).turn_id -ceq $nextIds.turn_id) 'Stale evidence replaced the newer turn'
+    $requestsAfter = Get-Content -LiteralPath $requestsLog -Raw
+    Assert ($requestsAfter.StartsWith($requestsBefore) -and (($requestsAfter.Substring($requestsBefore.Length) -split '\r?\n' | Where-Object { $_ }) -join '|') -ceq 'load|load|load|prompt') 'Reconciliation or continuation replayed a prompt or created a native session'
+    $listedAfter = (Rpc 'tools/call' @{name='list_sessions';arguments=@{}}).result.content[0].text | ConvertFrom-Json
+    Assert (@($listedAfter).Count -eq ($listedBeforeApproval.Count + 1) -and @($listedAfter | Where-Object session_id -ceq $activeIds.session_id).Count -eq 1) 'Continuation duplicated a Scheduler session'
     $null = Check-Turn 'error' 'failed'
     $unsubscribed = Rpc 'events/unsubscribe' @{name='turn.completed';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Assert ($null -eq $unsubscribed.error) 'Unsubscribe did not atomically replace subscriptions'
@@ -342,7 +367,7 @@ try {
     Remove-Item -LiteralPath $sidecarProbe
     $databaseText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($database))
     Assert ($databaseText.StartsWith('SQLite format 3')) 'Session registry is not SQLite'
-    foreach ($content in 'Remember blue plum','Remembered.','registry restart probe','must stay blocked',$subscription.delivery.secret,'test-token') {
+    foreach ($content in 'Remember blue plum','Remembered.','registry restart probe','must stay blocked','fresh registry follow-up',$subscription.delivery.secret,'test-token') {
         Assert (-not $databaseText.Contains($content)) 'Session registry stored conversation content or credentials'
     }
     $bad = Join-Path $workspace 'broad'
@@ -374,6 +399,7 @@ try {
     Write-Host 'PASS: exact-workspace revocation, readable history, blocked follow-up and reconnect, persisted revocation and idempotent reapproval'
     Write-Host 'PASS: restart preserved exact scheduler, turn and native IDs, terminal outcome and archived visibility'
     Write-Host 'PASS: restart held the active turn for confirmation, blocked execution and sent no replay or extra event'
+    Write-Host 'PASS: reconciliation preserved the native ID without replay or duplicates, and only the new turn emitted a signed completion'
     Write-Host 'PASS: SQLite registry excluded conversation contents and credentials and protected the database and sidecar directory'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {
