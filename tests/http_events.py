@@ -48,66 +48,34 @@ class HttpEvents(unittest.TestCase):
             workspace = Path(root, 'project'); workspace.mkdir()
             other = Path(root, 'other'); other.mkdir()
             link = Path(root, 'link'); link.symlink_to(workspace, target_is_directory=True)
-            with socket.socket() as sock:
-                sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
-            env = {'PATH': os.defpath, 'SESSION_SCHEDULER_HTTP_PORT':str(port),
-                   'SESSION_SCHEDULER_BEARER_TOKEN':'test-token', 'SESSION_SCHEDULER_ACCOUNT':'test-account',
-                   'SESSION_SCHEDULER_STATE_DIR':str(state), 'SESSION_SCHEDULER_WORKSPACES':str(configured),
-                   'SESSION_SCHEDULER_ACP_COMMAND':FIXTURE}
-            def rpc(name, args):
-                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
-                try:
-                    request = {'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':name,'arguments':args}}
-                    conn.request('POST','/mcp',json.dumps(request),{'Content-Type':'application/json','Authorization':'Bearer test-token'})
-                    response = conn.getresponse(); self.assertEqual(response.status,200)
-                    result = json.loads(response.read())['result']
-                    return result['isError'], json.loads(result['content'][0]['text'])
-                finally: conn.close()
-            def start():
-                process = subprocess.Popen([BIN], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                for _ in range(100):
-                    try: rpc('list_sessions', {}); return process
-                    except OSError: time.sleep(.02)
-                process.kill(); process.wait(); self.fail('scheduler did not start')
-            process = start()
-            try:
-                error, pending = rpc('delegate', {'workspace':str(link), 'prompt':'hello'})
+            with self.workspace_mcp(state, configured) as (_, call):
+                error, pending = call('delegate', {'workspace':str(link), 'prompt':'hello'})
                 self.assertFalse(error); self.assertEqual(pending['status'], 'approval_required')
                 self.assertEqual(pending['workspace'], str(workspace.resolve()))
-                self.assertEqual(rpc('list_sessions', {}), (False, []))
+                self.assertEqual(call('list_sessions', {}), (False, []))
                 link.unlink(); link.symlink_to(other, target_is_directory=True)
-                self.assertTrue(rpc('approve_workspace', {'attempt_id':pending['attempt_id']})[0])
-                self.assertEqual(rpc('list_sessions', {}), (False, []))
+                self.assertTrue(call('approve_workspace', {'attempt_id':pending['attempt_id']})[0])
+                self.assertEqual(call('list_sessions', {}), (False, []))
                 link.unlink(); link.symlink_to(workspace, target_is_directory=True)
                 responses = []
-                def approve(): responses.append(rpc('approve_workspace', {'attempt_id':pending['attempt_id']}))
+                def approve(): responses.append(call('approve_workspace', {'attempt_id':pending['attempt_id']}))
                 threads = [threading.Thread(target=approve) for _ in range(8)]
                 for thread in threads: thread.start()
                 for thread in threads: thread.join()
                 self.assertEqual(len(responses), 8); self.assertTrue(all(r == responses[0] for r in responses))
                 self.assertFalse(responses[0][0]); self.assertIn('session_id', responses[0][1])
-                self.assertEqual(len(rpc('list_sessions', {})[1]), 1)
+                self.assertEqual(len(call('list_sessions', {})[1]), 1)
                 ids = responses[0][1]
-                deadline = time.monotonic() + 5
-                while True:
-                    error, session = rpc('inspect_session', {'session_id':ids['session_id']})
-                    self.assertFalse(error)
-                    if session['status'] != 'running': break
-                    self.assertLess(time.monotonic(), deadline, 'fixture did not finish')
-                    time.sleep(.02)
-                self.assertEqual((session['workspace'], session['turn_id'], session['status']),
-                                 (str(workspace.resolve()), ids['turn_id'], 'completed'))
+                session = self.workspace_session(call, ids, 'completed')
+                self.assertEqual(session['workspace'], str(workspace.resolve()))
                 self.assertEqual(session['history'][0], {'role':'user', 'text':'hello'})
                 self.assertEqual(session['result'], 'fixture result')
-                self.assertEqual(rpc('delegate', {'workspace':str(other), 'prompt':'hello'})[1]['status'], 'approval_required')
-                self.assertEqual(rpc('delegate', {'workspace':str(Path(root, 'missing')), 'prompt':'hello'})[1]['status'], 'invalid_workspace')
-            finally: process.kill(); process.wait()
-            env['SESSION_SCHEDULER_WORKSPACES'] = ''
-            process = start()
-            try:
-                self.assertIn('session_id', rpc('delegate', {'workspace':str(link), 'prompt':'hello'})[1])
-                self.assertEqual(rpc('delegate', {'workspace':str(configured), 'prompt':'hello'})[1]['status'], 'approval_required')
-            finally: process.kill(); process.wait()
+                self.assertEqual(call('delegate', {'workspace':str(other), 'prompt':'hello'})[1]['status'], 'approval_required')
+                self.assertEqual(call('delegate', {'workspace':str(Path(root, 'missing')), 'prompt':'hello'})[1]['status'], 'invalid_workspace')
+
+            with self.workspace_mcp(state, '') as (_, call):
+                self.assertIn('session_id', call('delegate', {'workspace':str(link), 'prompt':'hello'})[1])
+                self.assertEqual(call('delegate', {'workspace':str(configured), 'prompt':'hello'})[1]['status'], 'approval_required')
 
     @contextmanager
     def workspace_mcp(self, state, configured):

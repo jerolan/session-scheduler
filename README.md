@@ -38,8 +38,11 @@ pendientes anteriores de esa carpeta. Repetir la aprobación de un intento
 que ya se inició devuelve los IDs originales sin ejecutar otro turno ni
 restaurar la confianza. Los intentos solo viven durante el proceso.
 
-Stdio usa los workspaces configurados en su propio proceso. La aprobación y
-la revocación están disponibles en el MCP HTTP autenticado.
+La aprobación y la revocación se aplican al Scheduler que sirve el MCP HTTP
+autenticado. Dot se conecta exclusivamente a ese endpoint `/mcp` a través
+de la MCP App de ChatGPT. Un proceso iniciado por separado con stdio usa su
+propia lista de workspaces al arrancar, al margen de las decisiones de
+confianza de HTTP.
 
 ## Selección de agente por MCP
 
