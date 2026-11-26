@@ -1001,33 +1001,44 @@ impl State {
         let expected = (proof["source"] == "acp_session_load"
             && proof["latest_turn_id"] == original["turn_id"])
             .then(|| (proof["turn_id"].as_str(), proof["stop_reason"].as_str()));
-        let observed_turn = expected.and_then(|(turn, _)| turn);
         let adapter = match self.session_adapter(&original) {
             Ok(adapter) => adapter,
             Err(error) => return (error, None),
         };
+        let conflict = || {
+            (
+                result(json!({"status":"turn_evidence_conflicts"}), true),
+                None,
+            )
+        };
+        let acp_id = match original["acp_session_id"].as_str() {
+            Some(id) => id,
+            None => return unavailable(),
+        };
+        let latest = original["turn_id"].as_str();
+        if let Some((Some(turn), reason)) = expected {
+            if Some(turn) != latest {
+                // A correction of an earlier turn cannot corroborate the latest outcome.
+                match self.observe_idle(&original, &workspace, &adapter, Some(turn)) {
+                    Ok((_, loaded)) if acp::verified_outcome(&loaded, acp_id, turn) == reason => {}
+                    Ok(_) => return conflict(),
+                    Err(error) => return (error, None),
+                }
+            }
+        }
         let (mut connection, loaded) =
-            match self.observe_idle(&original, &workspace, &adapter, observed_turn) {
+            match self.observe_idle(&original, &workspace, &adapter, latest) {
                 Ok(observation) => observation,
                 Err(error) => return (error, None),
             };
-        let acp_id = original["acp_session_id"].as_str().unwrap();
-        if let Some((Some(turn), reason)) = expected {
-            if acp::verified_outcome(&loaded, acp_id, turn) != reason {
-                return (
-                    result(json!({"status":"turn_evidence_conflicts"}), true),
-                    None,
-                );
-            }
-        } else if let Some(reason) = original["turn_id"]
-            .as_str()
-            .and_then(|turn| acp::verified_outcome(&loaded, acp_id, turn))
-        {
-            if original["stop_reason"] != reason {
-                return (
-                    result(json!({"status":"turn_evidence_conflicts"}), true),
-                    None,
-                );
+        if let Some(turn) = latest {
+            let observed = acp::verified_outcome(&loaded, acp_id, turn);
+            if let Some((_, reason)) = expected.filter(|(target, _)| *target == latest) {
+                if observed != reason {
+                    return conflict();
+                }
+            } else if observed.is_some_and(|reason| original["stop_reason"] != reason) {
+                return conflict();
             }
         }
 

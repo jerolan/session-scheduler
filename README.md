@@ -170,7 +170,12 @@ incluir `_meta["session-scheduler/sessionState"]` con `sessionId`, `cwd`
 (la ruta de workspace de la solicitud) y `status: "idle"`. El adaptador
 debe verificar el estado actual de la sesión en ese workspace, incluyendo
 cualquier actividad del agente que pueda seguir en curso. La recarga
-estándar de ACP por sí sola no confirma que la sesión esté libre.
+estándar de ACP por sí sola no confirma que la sesión esté libre. Los
+fixtures de aceptación implementan esta evidencia. La importación de una
+sesión real de OpenCode 1.19.6 confirma el registro de la referencia, pero
+no verifica el estado del agente. Para continuar tras reiniciar, tanto
+Codex como OpenCode requieren un adaptador que proporcione esta evidencia
+positiva. Si falta, el Scheduler rechaza el nuevo envío.
 
 Para corregir un turno, el Scheduler incluye su ID en
 `params._meta["session-scheduler/promptRequestId"]`. La respuesta debe
@@ -179,8 +184,10 @@ adaptador que desconoce el estado actual o el desenlace deja el registro
 por confirmar. Si hay evidencia, `inspect_session` conserva la fuente
 `acp_session_load`, el ID del turno pertinente y la fecha de la observación.
 La reconciliación omite el envío de prompts y la emisión de eventos. Un
-`follow_up` posterior comprueba la evidencia de nuevo y tiene su propio
-evento de finalización.
+`follow_up` posterior comprueba la evidencia de nuevo y pide el desenlace
+del último turno, incluso si la corrección fue de un turno anterior.
+Si el adaptador contradice el último desenlace confirmado, se rechaza el
+envío. Un turno nuevo tiene su propio evento de finalización.
 
 ## Registro local en Codex Desktop
 

@@ -43,6 +43,13 @@ for line in sys.stdin:
                         'stopReason': 'cancelled' if scenario == 'conflicting-outcome' else 'end_turn',
                     },
                 }
+            latest_turn = Path('contradictory-latest-turn')
+            if latest_turn.exists():
+                contradictory = latest_turn.read_text()
+                if msg['params'].get('_meta', {}).get(
+                        'session-scheduler/promptRequestId') == contradictory:
+                    result['_meta']['session-scheduler/turnOutcome'].update(
+                        promptRequestId=contradictory, stopReason='end_turn')
             update('private history sent during load')
             print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}), flush=True)
             continue

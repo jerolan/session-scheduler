@@ -277,6 +277,12 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(after['unresolved_turn_ids'], [])
                 self.assertEqual(after['acp_session_id'], before['acp_session_id'])
                 self.assertTrue(call('reconcile_session', original)[0])
+                contradiction = project / 'contradictory-latest-turn'
+                contradiction.write_text(latest['turn_id'])
+                self.assertEqual(call('follow_up', dict(follow, prompt='must not run')),
+                                 (True, {'status': 'turn_evidence_conflicts'}))
+                self.assertEqual(call('inspect_session', latest), (False, after))
+                contradiction.unlink()
                 error, new = call('follow_up', dict(follow, prompt='newest'))
                 self.assertFalse(error, new)
                 self.workspace_session(call, new, 'completed')
