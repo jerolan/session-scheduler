@@ -23,8 +23,8 @@ use windows_sys::Win32::{
         },
         EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorOwner,
         GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION,
-        OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY,
-        TOKEN_USER,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+        SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
     },
     Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, GetDriveTypeW, MoveFileExW, CREATE_NEW, FILE_ALL_ACCESS,
@@ -80,7 +80,7 @@ fn permission_error() -> io::Error {
     )
 }
 
-fn owner_descriptor() -> io::Result<Vec<u32>> {
+fn owner_descriptor(object_inherit: bool) -> io::Result<Vec<u32>> {
     let mut token = null_mut();
     // The successful call transfers an owned process-token handle.
     unsafe {
@@ -123,7 +123,8 @@ fn owner_descriptor() -> io::Result<Vec<u32>> {
         }
         String::from_utf16(std::slice::from_raw_parts(sid, len)).map_err(io::Error::other)?
     };
-    let sddl: Vec<_> = format!("O:{sid}D:P(A;;FA;;;{sid})")
+    let flags = if object_inherit { "OI" } else { "" };
+    let sddl: Vec<_> = format!("O:{sid}D:P(A;{flags};FA;;;{sid})")
         .encode_utf16()
         .chain([0])
         .collect();
@@ -217,7 +218,7 @@ impl StateAccess {
         }
         let mut directory = PathBuf::from(format!(r"\\?\{}:\", drive_letter));
         let mut state = Self {
-            descriptor: owner_descriptor()?,
+            descriptor: owner_descriptor(false)?,
             _directories: vec![open_file(&directory, 0, OPEN_EXISTING, true, null())?],
         };
         while let Some(part) = parts.next() {
@@ -228,15 +229,18 @@ impl StateAccess {
             directory.push(name);
             if parts.peek().is_none() {
                 let name = wide(directory.as_os_str())?;
-                if let Err(error) =
-                    unsafe { check(CreateDirectoryW(name.as_ptr(), &state.attributes())) }
-                {
+                if let Err(error) = unsafe {
+                    check(CreateDirectoryW(
+                        name.as_ptr(),
+                        &Self::attributes(&state.descriptor),
+                    ))
+                } {
                     if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
                         return Err(error);
                     }
                 }
                 let handle = open_file(&directory, READ_CONTROL, OPEN_EXISTING, true, null())?;
-                state.verify(&handle)?;
+                state.verify(&handle, 0)?;
                 state._directories.push(handle);
             } else {
                 state
@@ -247,15 +251,30 @@ impl StateAccess {
         Ok((directory, state))
     }
 
-    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+    pub fn open_registry_directory(&mut self, path: &Path) -> io::Result<()> {
+        let descriptor = owner_descriptor(true)?;
+        let name = wide(path.as_os_str())?;
+        let attributes = Self::attributes(&descriptor);
+        if let Err(error) = unsafe { check(CreateDirectoryW(name.as_ptr(), &attributes)) } {
+            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                return Err(error);
+            }
+        }
+        let directory = open_file(path, READ_CONTROL, OPEN_EXISTING, true, null())?;
+        self.verify(&directory, OBJECT_INHERIT_ACE as u8)?;
+        self._directories.push(directory);
+        Ok(())
+    }
+
+    fn attributes(descriptor: &[u32]) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.descriptor.as_ptr().cast_mut().cast(),
+            lpSecurityDescriptor: descriptor.as_ptr().cast_mut().cast(),
             bInheritHandle: 0,
         }
     }
 
-    fn verify(&self, file: &File) -> io::Result<()> {
+    fn verify(&self, file: &File, ace_flags: u8) -> io::Result<()> {
         let mut expected: PSID = null_mut();
         let mut owner: PSID = null_mut();
         let mut acl = null_mut();
@@ -302,7 +321,7 @@ impl StateAccess {
             let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
             // ACCESS_ALLOWED_ACE_TYPE is zero. Inspect the common header before its SID or mask.
             if (*ace).Header.AceType != 0
-                || (*ace).Header.AceFlags != 0
+                || (*ace).Header.AceFlags != ace_flags
                 || (*ace).Mask != FILE_ALL_ACCESS
                 || EqualSid(
                     std::ptr::addr_of!((*ace).SidStart).cast_mut().cast(),
@@ -323,7 +342,7 @@ impl StateAccess {
             false,
             null(),
         )?;
-        self.verify(&file)?;
+        self.verify(&file, 0)?;
         Ok(file)
     }
 
@@ -333,9 +352,9 @@ impl StateAccess {
             GENERIC_WRITE | READ_CONTROL,
             CREATE_NEW,
             false,
-            &self.attributes(),
+            &Self::attributes(&self.descriptor),
         )?;
-        self.verify(&file)?;
+        self.verify(&file, 0)?;
         Ok(file)
     }
 

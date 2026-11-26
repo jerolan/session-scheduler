@@ -1,11 +1,13 @@
 mod acp;
 mod events;
 mod http;
+mod session_registry;
 mod state_files;
 use acp::{AcpJob, Start};
 use events::TurnEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use session_registry::{SessionRegistry, Sessions};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -41,7 +43,6 @@ struct Adapter {
     kind: AgentKind,
     executable: PathBuf,
 }
-type Sessions = Arc<Mutex<BTreeMap<String, Value>>>;
 struct PendingCancel {
     acp_id: String,
     writer: Arc<Mutex<ChildStdin>>,
@@ -370,7 +371,7 @@ impl Drop for State {
     }
 }
 impl State {
-    fn new(events: Option<Arc<events::Events>>) -> Self {
+    fn new(events: Option<Arc<events::Events>>) -> io::Result<Self> {
         let configured: Vec<PathBuf> = env::var_os("SESSION_SCHEDULER_WORKSPACES")
             .map(|v| {
                 env::split_paths(&v)
@@ -408,7 +409,36 @@ impl State {
         }
         let executable =
             |name| env::var_os(name).and_then(|p| PathBuf::from(p).canonicalize().ok());
-        Self {
+        let sessions = Arc::new(SessionRegistry::new(events.is_some())?);
+        if let Some(events) = &events {
+            for (id, turn_id, reason) in events.persisted_completions() {
+                let mut records = sessions.lock().unwrap();
+                if let Some(record) = records.get_mut(&id) {
+                    if let Some(ids) = record["unresolved_turn_ids"].as_array_mut() {
+                        ids.retain(|id| id != &turn_id);
+                    }
+                    if record["turn_id"] == turn_id && record["status"] == "pending_confirmation" {
+                        record["status"] = json!(match reason.as_str() {
+                            "end_turn" => "completed",
+                            "cancelled" => "cancelled",
+                            _ => "failed",
+                        });
+                        record["stop_reason"] = if reason == "failed" {
+                            Value::Null
+                        } else {
+                            json!(reason)
+                        };
+                    }
+                    record["restart_blocked"] = json!(
+                        record["status"] == "pending_confirmation"
+                            || record["unresolved_turn_ids"]
+                                .as_array()
+                                .is_some_and(|ids| !ids.is_empty())
+                    );
+                }
+            }
+        }
+        Ok(Self {
             configured,
             workspace_trust: Mutex::new(WorkspaceTrust {
                 decisions,
@@ -417,12 +447,12 @@ impl State {
             trust_store,
             codex_command: executable("SESSION_SCHEDULER_ACP_COMMAND"),
             opencode_command: executable("SESSION_SCHEDULER_OPENCODE_COMMAND"),
-            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             children: Arc::new(Mutex::new(ChildRegistry::default())),
             cancel_writers: Arc::new(Mutex::new(BTreeMap::new())),
             events,
-        }
+        })
     }
     fn is_workspace_trusted(&self, decisions: &WorkspaceDecisions, workspace: &Path) -> bool {
         (self.events.is_none() || self.trust_store.is_some())
@@ -650,10 +680,12 @@ impl State {
         let Some(turn_id) = turn_id.map(str::to_owned) else {
             return (result(json!("Invalid turn ID"), true), None);
         };
-        if session_has_status(
-            record,
-            &["running", "cancelling", "completion_pending", "recovering"],
-        ) || record["archived"] == true
+        if record["restart_blocked"] == true
+            || session_has_status(
+                record,
+                &["running", "cancelling", "completion_pending", "recovering"],
+            )
+            || record["archived"] == true
             || !turn_state_mut(record, &turn_id).is_some_and(|turn| turn["status"] == "unknown")
         {
             return (
@@ -734,10 +766,12 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if session_has_status(
-            record,
-            &["running", "cancelling", "completion_pending", "recovering"],
-        ) || record["archived"] == true
+        if record["restart_blocked"] == true
+            || session_has_status(
+                record,
+                &["running", "cancelling", "completion_pending", "recovering"],
+            )
+            || record["archived"] == true
         {
             return (result(json!("Session is not available"), true), None);
         }
@@ -987,7 +1021,7 @@ fn main() {
         }
         return;
     }
-    let state = State::new(None);
+    let state = State::new(None).expect("in-memory scheduler state");
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Ok(request) = serde_json::from_str::<Value>(&line) else {

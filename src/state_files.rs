@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
@@ -57,11 +57,14 @@ impl StateFiles {
     }
 
     pub fn read(&self, kind: StateFile) -> io::Result<Option<File>> {
-        let path = self.directory.join(kind.name());
+        self.read_private(&self.directory.join(kind.name()))
+    }
+
+    fn read_private(&self, path: &Path) -> io::Result<Option<File>> {
         #[cfg(unix)]
-        let result = match fs::symlink_metadata(&path) {
+        let result = match fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_file() && meta.permissions().mode() & 0o077 == 0 => {
-                File::open(&path)
+                File::open(path)
             }
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -70,12 +73,34 @@ impl StateFiles {
             Err(error) => Err(error),
         };
         #[cfg(windows)]
-        let result = self.access.read(&path);
+        let result = self.access.read(path);
         match result {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    pub fn database_path(&mut self) -> io::Result<PathBuf> {
+        // SQLite creates rollback journals alongside the database.
+        let directory = self.directory.join("registry");
+        #[cfg(unix)]
+        Self::open(directory.clone())?;
+        #[cfg(windows)]
+        self.access.open_registry_directory(&directory)?;
+
+        let path = directory.join("sessions.sqlite");
+        if self.read_private(&path)?.is_none() {
+            #[cfg(unix)]
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            #[cfg(windows)]
+            self.access.create(&path)?;
+        }
+        Ok(path)
     }
 
     pub fn replace(

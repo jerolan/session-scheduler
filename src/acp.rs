@@ -17,7 +17,7 @@ use std::{
 const RECOVERY_ATTEMPTS: usize = 3;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn known_stop_reason(reason: &str) -> bool {
+pub(crate) fn known_stop_reason(reason: &str) -> bool {
     matches!(
         reason,
         "end_turn" | "cancelled" | "refusal" | "max_tokens" | "max_turn_requests" | "failed"

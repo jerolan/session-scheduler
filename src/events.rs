@@ -525,6 +525,23 @@ impl Events {
             json!({"id":id,"refreshBefore":expires.to_rfc3339_opts(chrono::SecondsFormat::AutoSi,true),"cursor":null,"truncated":false}),
         )
     }
+    pub fn persisted_completions(&self) -> Vec<(String, String, String)> {
+        self.pending
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|event| event.event == TurnEvent::Completed)
+            .map(|event| {
+                (
+                    event.session_id.clone(),
+                    event.turn_id.clone(),
+                    event.reason.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub fn queue_turn_event(
         &self,
         event: TurnEvent,

@@ -1,5 +1,14 @@
 // Standalone synthetic ACP agent; build with rustc, without Cargo dependencies.
 use std::io::{self, BufRead, Write};
+fn record_request(kind: &str) {
+    let mut requests = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("acp-requests.log")
+        .unwrap();
+    writeln!(requests, "{kind}").unwrap();
+}
+
 fn main() {
     let mut lines = io::stdin().lock().lines();
     let mut session_id = format!("fixture-{}", std::process::id());
@@ -9,11 +18,13 @@ fn main() {
         let response = if line.contains("\"initialize\"") {
             r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"authMethods":[]}}"#
         } else if line.contains("\"session/new\"") {
+            record_request("new");
             remembered = false;
             println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{session_id}"}}}}"#);
             io::stdout().flush().unwrap();
             continue;
         } else if line.contains("\"session/load\"") {
+            record_request("load");
             let saved = std::fs::read_to_string("interrupted.txt").unwrap();
             let (session, original_request) = saved.split_once('\n').unwrap();
             assert!(line.contains(&format!(r#""sessionId":"{session}""#)));
@@ -35,6 +46,7 @@ fn main() {
             io::stdout().flush().unwrap();
             continue;
         } else if line.contains("\"session/prompt\"") {
+            record_request("prompt");
             let id = line
                 .split_once(r#""id":"#)
                 .and_then(|(_, tail)| tail.split([',', '}']).next())
@@ -54,6 +66,12 @@ fn main() {
             {
                 r#""error":{"code":-32603,"message":"fixture failure"}"#
             } else {
+                if line.contains("\"registry restart probe\"") {
+                    std::fs::write("registry-probe-ready", &session_id).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 if line.contains("\"disconnect with pong\"") {
                     let mut saved = std::fs::OpenOptions::new()
                         .write(true)

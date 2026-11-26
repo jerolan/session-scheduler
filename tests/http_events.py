@@ -1,4 +1,4 @@
-import base64, hashlib, hmac, http.client, json, os, queue, socket, subprocess, tempfile, threading, time, unittest
+import base64, hashlib, hmac, http.client, json, os, queue, socket, sqlite3, subprocess, tempfile, threading, time, unittest
 from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +41,49 @@ class RecoveringReceiver(Receiver):
 
 
 class HttpEvents(unittest.TestCase):
+    def test_session_registry_survives_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            with self.workspace_mcp(state, project) as (_, call):
+                error, ids = call('delegate', {'workspace':str(project), 'prompt':'private-prompt-sentinel'})
+                self.assertFalse(error)
+                finished = self.workspace_session(call, ids, 'completed')
+                self.assertIsNotNone(finished['acp_session_id'])
+            with self.workspace_mcp(state, project) as (_, call):
+                error, restored = call('inspect_session', ids)
+                self.assertFalse(error)
+                self.assertEqual(restored['session_id'], ids['session_id'])
+                self.assertEqual(restored['turn_id'], ids['turn_id'])
+                self.assertEqual(restored['status'], 'completed')
+                self.assertEqual(restored['acp_session_id'], finished['acp_session_id'])
+                self.assertEqual(len(call('list_sessions', {})[1]), 1)
+            persisted = b''.join(path.read_bytes() for path in state.rglob('sessions.sqlite*') if path.is_file())
+            self.assertNotIn(b'private-prompt-sentinel', persisted)
+            self.assertNotIn(b'fixture result', persisted)
+
+    def test_interrupted_turn_is_blocked_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            with self.workspace_mcp(state, project) as (_, call):
+                error, ids = call('delegate', {'workspace':str(project), 'prompt':'hold_turn'})
+                self.assertFalse(error)
+                deadline = time.monotonic() + 5
+                while not (project / 'prompt-ready').exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                before = call('inspect_session', ids)[1]
+                self.assertIsNotNone(before['acp_session_id'])
+            with self.workspace_mcp(state, project) as (_, call):
+                error, after = call('inspect_session', ids)
+                self.assertFalse(error)
+                self.assertEqual(after['status'], 'pending_confirmation')
+                self.assertEqual(after['acp_session_id'], before['acp_session_id'])
+                self.assertTrue(call('follow_up', {'session_id':ids['session_id'], 'prompt':'unexpected'})[0])
+                self.assertTrue(call('reconnect_session', ids)[0])
+                self.assertEqual(call('inspect_session', ids)[1]['status'], 'pending_confirmation')
+
     def test_workspace_approval_is_exact_idempotent_and_persistent(self):
         with tempfile.TemporaryDirectory() as root:
             state = Path(root, 'state'); state.mkdir(mode=0o700)
@@ -232,7 +275,7 @@ class HttpEvents(unittest.TestCase):
                 error, pending = call('delegate', dict(args, prompt='hello'))
                 self.assertFalse(error)
                 self.assertEqual(pending['status'], 'approval_required')
-                self.assertEqual(call('list_sessions', {}), (False, []))
+                self.assertIn(ids['session_id'], [item['session_id'] for item in call('list_sessions', {})[1]])
                 self.assertIn('session_id', call('delegate', {'workspace': str(legacy), 'prompt': 'hello'})[1])
                 error, _ = call('approve_workspace', {'attempt_id': pending['attempt_id']})
                 self.assertFalse(error)
@@ -410,12 +453,27 @@ class HttpEvents(unittest.TestCase):
                     persisted = json.loads(pending_path.read_text())
                 finally:
                     scheduler.kill()
+            # Model a crash after the event was durably queued but before the
+            # corresponding registry commit, using the real pending event.
+            crash_window = failure_status == 408 and final_status == 'completed'
+            if crash_window:
+                database = next(Path(state).rglob('sessions.sqlite'))
+                with sqlite3.connect(database) as db:
+                    metadata = json.loads(db.execute('SELECT metadata FROM sessions WHERE id = ?', (ids['session_id'],)).fetchone()[0])
+                    metadata['status'] = 'completion_pending'
+                    metadata['stop_reason'] = None
+                    metadata['archived'] = False
+                    db.execute('UPDATE sessions SET metadata = ? WHERE id = ?', (json.dumps(metadata), ids['session_id']))
             receiver.recovered.set()
             with start() as scheduler:
                 try:
                     wait_for_scheduler()
-                    self.assertEqual(call('list_sessions', {}), (False, []))
-                    self.assertEqual(call('inspect_session', session), (True, 'Session not found'))
+                    error, restored = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual(restored['turn_id'], ids['turn_id'])
+                    self.assertEqual(restored['status'], 'pending_confirmation' if final_status == 'unknown' else final_status)
+                    listed = [item['session_id'] for item in call('list_sessions', {})[1]]
+                    self.assertEqual(ids['session_id'] in listed, final_status == 'unknown' or crash_window)
                     if not retry:
                         self.assertEqual(persisted, [])
                         with self.assertRaises(queue.Empty):

@@ -124,6 +124,14 @@ registrado el evento. Los campos del último turno conservan su valor.
 Resuelve los turnos indeterminados antes de archivar la sesión. La
 reconexión inicializa el adaptador y carga la sesión existente.
 
+Tras reiniciar el servicio HTTP, el registro SQLite conserva los IDs,
+el último estado conocido y el archivado. Usa `list_sessions` para
+localizar sesiones activas e `inspect_session` para consultar sus
+metadatos, incluso si están archivadas. Un turno sin desenlace confirmado
+queda en `pending_confirmation` y bloquea `follow_up` y
+`reconnect_session` para esa sesión. El historial y los resultados
+permanecen en el agente.
+
 ACP estándar puede recargar la conversación. Para confirmar el desenlace,
 el scheduler requiere que la respuesta de `session/load` incluya
 `_meta["session-scheduler/turnOutcome"]` con `sessionId`, `promptRequestId`
