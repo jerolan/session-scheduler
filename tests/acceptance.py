@@ -323,10 +323,11 @@ class Acceptance(unittest.TestCase):
             time.sleep(.05)
         self.fail(f'expected {expected}, got {record["status"]}')
 
-    def test_stdio_cannot_approve_workspace(self):
+    def test_stdio_cannot_change_workspace_trust(self):
         workspace = Path(self.tmp.name, 'new-project'); workspace.mkdir()
         self.assertTrue(self.call('delegate', {'workspace':str(workspace), 'prompt':'hello'})['isError'])
         self.assertTrue(self.call('approve_workspace', {'attempt_id':'anything'})['isError'])
+        self.assertTrue(self.call('revoke_workspace', {'workspace': self.tmp.name})['isError'])
         self.assertEqual(json.loads(self.call('list_sessions', {})['content'][0]['text']), [])
 
     def test_rejects_workspace_outside_allowlist(self):

@@ -14,16 +14,32 @@ continúa el encargo original. Ante una negativa o ausencia de respuesta no se
 llama a la herramienta. Una ruta inválida o inaccesible devuelve
 `invalid_workspace`.
 
-La confianza se guarda en el directorio privado de estado y sobrevive al
-reinicio. Se aplica solo a la carpeta efectiva exacta, sin incluir otras
-carpetas. La configuración `SESSION_SCHEDULER_WORKSPACES` sigue autorizando
-solo las rutas configuradas mientras esté vigente; no se copia al almacén de
-confianza. Los intentos pendientes y las referencias a los ya iniciados viven
-solo durante el proceso. Mientras siga activo, repetir `approve_workspace`
-con el mismo ID devuelve los mismos IDs de sesión y turno sin volver a lanzar
-el encargo. Tras un reinicio hay que iniciar un nuevo intento. El transporte
-stdio conserva el acceso limitado a los workspaces configurados y no ofrece
-la herramienta de aprobación.
+La confianza se guarda en el directorio privado de estado y se aplica solo a
+la carpeta efectiva exacta. En HTTP, las rutas de
+`SESSION_SCHEDULER_WORKSPACES` se consideran de confianza por defecto.
+
+Para retirar la confianza, pide en el chat que se revoque la carpeta. El
+solicitante llama a `revoke_workspace` con la ruta absoluta en `workspace`.
+El resultado `revoked` confirma la ruta efectiva. La revocación surte efecto
+sin reiniciar, se conserva tras reiniciar y prevalece incluso si esa
+carpeta sigue en `SESSION_SCHEDULER_WORKSPACES`. Las otras carpetas conservan
+sus permisos.
+
+El turno activo puede terminar y el historial disponible se puede consultar
+con `inspect_session`. Una nueva delegación devuelve `approval_required`.
+`follow_up` y `reconnect_session` devuelven `workspace_not_trusted` cuando
+el workspace de la sesión ya no es de confianza.
+
+Para volver a autorizar la carpeta, usa el flujo de aprobación de una nueva
+delegación. Tras el «sí» explícito, `approve_workspace` registra la confianza,
+continúa ese encargo y vuelve a habilitar el seguimiento y la reconexión de
+las sesiones que sigan disponibles. La revocación invalida los intentos
+pendientes anteriores de esa carpeta. Repetir la aprobación de un intento
+que ya se inició devuelve los IDs originales sin ejecutar otro turno ni
+restaurar la confianza. Los intentos solo viven durante el proceso.
+
+Stdio usa los workspaces configurados en su propio proceso. La aprobación y
+la revocación están disponibles en el MCP HTTP autenticado.
 
 ## Selección de agente por MCP
 

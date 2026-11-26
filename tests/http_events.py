@@ -109,6 +109,169 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(rpc('delegate', {'workspace':str(configured), 'prompt':'hello'})[1]['status'], 'approval_required')
             finally: process.kill(); process.wait()
 
+    @contextmanager
+    def workspace_mcp(self, state, configured):
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        env = dict(PATH=os.defpath, SESSION_SCHEDULER_HTTP_PORT=str(port),
+                   SESSION_SCHEDULER_BEARER_TOKEN='test-token',
+                   SESSION_SCHEDULER_ACCOUNT='test-account',
+                   SESSION_SCHEDULER_STATE_DIR=str(state),
+                   SESSION_SCHEDULER_WORKSPACES=str(configured),
+                   SESSION_SCHEDULER_ACP_COMMAND=FIXTURE)
+
+        def rpc(method, params, authenticated=True):
+            headers = {'Content-Type': 'application/json'}
+            if authenticated:
+                headers['Authorization'] = 'Bearer test-token'
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
+            try:
+                conn.request('POST', '/mcp', json.dumps({
+                    'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params,
+                }), headers)
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200 if authenticated else 401)
+                return json.loads(response.read())['result'] if authenticated else None
+            finally:
+                conn.close()
+
+        def call(name, arguments):
+            result = rpc('tools/call', {'name': name, 'arguments': arguments})
+            return result['isError'], json.loads(result['content'][0]['text'])
+
+        with subprocess.Popen([BIN], env=env) as process:
+            try:
+                for _ in range(100):
+                    try:
+                        rpc('ping', {})
+                        break
+                    except OSError:
+                        time.sleep(.02)
+                else:
+                    self.fail('isolated scheduler did not start')
+                yield rpc, call
+            finally:
+                process.kill()
+
+    def workspace_session(self, call, ids, status):
+        deadline = time.monotonic() + 5
+        while True:
+            error, session = call('inspect_session', ids)
+            self.assertFalse(error)
+            if session['status'] == status:
+                self.assertEqual(session['turn_id'], ids['turn_id'])
+                return session
+            self.assertLess(time.monotonic(), deadline, f'expected {status}, got {session["status"]}')
+            time.sleep(.02)
+
+    def test_workspace_revocation_preserves_the_active_turn_and_requires_fresh_approval(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state')
+            state.mkdir(mode=0o700)
+            project = Path(root, 'project')
+            project.mkdir()
+            other = project / 'other'
+            other.mkdir()
+            alias = Path(root, 'alias')
+            alias.symlink_to(project, target_is_directory=True)
+
+            with self.workspace_mcp(state, other) as (rpc, call):
+                args = {'workspace': str(project), 'prompt': 'hold_turn'}
+                error, pending = call('delegate', args)
+                self.assertFalse(error)
+                stale = call('delegate', args)[1]
+                original = {'attempt_id': pending['attempt_id']}
+                error, ids = call('approve_workspace', original)
+                self.assertFalse(error)
+                deadline = time.monotonic() + 5
+                while not (project / 'prompt-ready').exists():
+                    self.assertLess(time.monotonic(), deadline, 'fixture never received the turn')
+                    time.sleep(.02)
+
+                self.assertIn('revoke_workspace', [tool['name'] for tool in rpc('tools/list', {})['tools']])
+                revoke = {'workspace': str(alias)}
+                rpc('tools/call', {'name': 'revoke_workspace', 'arguments': revoke}, authenticated=False)
+                self.assertEqual(call('revoke_workspace', revoke),
+                                 (False, {'status': 'revoked', 'workspace': str(project)}))
+                self.workspace_session(call, ids, 'running')
+                self.assertEqual(call('approve_workspace', original), (False, ids))
+                self.assertTrue(call('approve_workspace', {'attempt_id': stale['attempt_id']})[0])
+
+                (project / 'release-turn').touch()
+                completed = self.workspace_session(call, ids, 'completed')
+                self.assertEqual(completed['result'], 'fixture result')
+                self.assertEqual(call('follow_up', {**ids, 'prompt': 'recall'}),
+                                 (True, {'status': 'workspace_not_trusted', 'workspace': str(project)}))
+                self.assertEqual(call('inspect_session', ids), (False, completed))
+                self.assertEqual(len(call('list_sessions', {})[1]), 1)
+
+                self.assertIn('session_id', call('delegate', {'workspace': str(other), 'prompt': 'hello'})[1])
+                error, pending = call('delegate', dict(args, prompt='hello'))
+                self.assertFalse(error)
+                self.assertEqual(pending['status'], 'approval_required')
+                approval = {'attempt_id': pending['attempt_id']}
+                error, approved = call('approve_workspace', approval)
+                self.assertFalse(error)
+                self.assertEqual(call('approve_workspace', approval), (False, approved))
+                self.assertEqual(len(call('list_sessions', {})[1]), 3)
+
+                error, continued = call('follow_up', {**ids, 'prompt': 'recall'})
+                self.assertFalse(error)
+                self.assertEqual(continued['session_id'], ids['session_id'])
+                self.assertNotEqual(continued['turn_id'], ids['turn_id'])
+                self.workspace_session(call, continued, 'completed')
+
+    def test_revocation_blocks_reconnect_and_overrides_configured_trust_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state')
+            state.mkdir(mode=0o700)
+            project = Path(root, 'configured')
+            project.mkdir()
+            legacy = Path(root, 'legacy')
+            legacy.mkdir()
+            trust_file = state / 'trusted-workspaces.json'
+            trust_file.write_text(json.dumps([str(legacy)]))
+            trust_file.chmod(0o600)
+
+            args = {'workspace': str(project), 'prompt': 'recover_manual'}
+            revoke = {'workspace': str(project)}
+            revoked = (False, {'status': 'revoked', **revoke})
+            with self.workspace_mcp(state, project) as (_, call):
+                self.assertIn('session_id', call('delegate', {'workspace': str(legacy), 'prompt': 'hello'})[1])
+                error, ids = call('delegate', args)
+                self.assertFalse(error)
+                history = self.workspace_session(call, ids, 'unknown')
+                self.assertEqual(call('revoke_workspace', revoke), revoked)
+                self.assertEqual(call('revoke_workspace', revoke), revoked)
+                (project / 'outcome-ready').touch()
+
+                self.assertEqual(call('reconnect_session', ids),
+                                 (True, {'status': 'workspace_not_trusted', **revoke}))
+                self.assertEqual(call('inspect_session', ids), (False, history))
+
+                error, pending = call('delegate', dict(args, prompt='hello'))
+                self.assertFalse(error)
+                self.assertEqual(pending['status'], 'approval_required')
+                error, _ = call('approve_workspace', {'attempt_id': pending['attempt_id']})
+                self.assertFalse(error)
+                self.assertEqual(call('reconnect_session', ids), (False, {**ids, 'status': 'recovering'}))
+                recovered = self.workspace_session(call, ids, 'completed')
+                self.assertEqual(recovered['stop_reason'], 'end_turn')
+                self.assertEqual(call('revoke_workspace', revoke), revoked)
+
+            with self.workspace_mcp(state, project) as (_, call):
+                error, pending = call('delegate', dict(args, prompt='hello'))
+                self.assertFalse(error)
+                self.assertEqual(pending['status'], 'approval_required')
+                self.assertEqual(call('list_sessions', {}), (False, []))
+                self.assertIn('session_id', call('delegate', {'workspace': str(legacy), 'prompt': 'hello'})[1])
+                error, _ = call('approve_workspace', {'attempt_id': pending['attempt_id']})
+                self.assertFalse(error)
+
+            with self.workspace_mcp(state, '') as (_, call):
+                self.assertIn('session_id', call('delegate', dict(args, prompt='hello'))[1])
+
     def test_completion_waits_for_storage_and_survives_scheduler_restart(self):
         for prompt, final_status, reason in (
             ('pong', 'completed', 'end_turn'),

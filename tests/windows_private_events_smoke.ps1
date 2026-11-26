@@ -235,10 +235,37 @@ try {
     $afterFollowUp = Inspect $unknown.session_id
     Assert ($followUp.ids.turn_id -ne $unknown.turn_id -and $afterFollowUp.acp_session_id -eq $beforeFollowUp.acp_session_id -and $afterFollowUp.result -ceq 'pong') 'Explicit follow-up did not reuse loaded context with a new turn'
     Assert ($unknown.turn_id -in $afterFollowUp.unresolved_turn_ids) 'The original indeterminate turn ID was lost'
+    $tools = Rpc 'tools/list' @{}
+    Assert ('revoke_workspace' -in $tools.result.tools.name) 'Revocation missing from MCP discovery'
+    $revocation = Rpc 'tools/call' @{name='revoke_workspace';arguments=@{workspace=$workspace}}
+    $revoked = $revocation.result.content[0].text | ConvertFrom-Json
+    Assert (-not $revocation.result.isError -and $revoked.status -eq 'revoked' -and $revoked.workspace -ceq $after.workspace) 'Revocation did not confirm the exact workspace'
+    Check-PrivateAcl (Join-Path $state 'trusted-workspaces.json')
+    $blocked = Rpc 'tools/call' @{name='follow_up';arguments=@{session_id=$first.ids.session_id;prompt='blocked'}}
+    Assert ($blocked.result.isError -and ($blocked.result.content[0].text | ConvertFrom-Json).status -eq 'workspace_not_trusted') 'Revocation did not block follow-up'
+    $blocked = Rpc 'tools/call' @{name='reconnect_session';arguments=@{session_id=$unknown.session_id;turn_id=$unknown.turn_id}}
+    Assert ($blocked.result.isError -and ($blocked.result.content[0].text | ConvertFrom-Json).status -eq 'workspace_not_trusted') 'Revocation did not block reconnection'
+    $afterRevoke = Inspect $first.ids.session_id
+    Assert (($afterRevoke.history.text -join '|') -ceq ($after.history.text -join '|')) 'Revocation changed readable history'
+
     $null = Rpc 'events/unsubscribe' @{name='turn.recovery_required';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Stop-Scheduler
     Start-Scheduler
+    $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt='error'}}
+    $pending = $delegation.result.content[0].text | ConvertFrom-Json
+    Assert (-not $delegation.result.isError -and $pending.status -eq 'approval_required' -and $pending.workspace -ceq $revoked.workspace) 'Revoked startup workspace regained trust after restart'
+    $sessions = Rpc 'tools/call' @{name='list_sessions';arguments=@{}}
+    Assert ($sessions.result.content[0].text -ceq '[]') 'Unapproved delegation created a session'
+    $approval = @{name='approve_workspace';arguments=@{attempt_id=$pending.attempt_id}}
+    $approved = Rpc 'tools/call' $approval
+    $retry = Rpc 'tools/call' $approval
+    $approvedIds = $approved.result.content[0].text | ConvertFrom-Json
+    Assert (-not $approved.result.isError -and $approvedIds.session_id -and $approvedIds.turn_id -and -not $retry.result.isError -and $retry.result.content[0].text -ceq $approved.result.content[0].text) 'Explicit reapproval was not idempotent'
     # The original subscription must deliver before any attempt to subscribe again.
+    $message = Next-Message; $event = $message.body | ConvertFrom-Json
+    Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.data.session_id -eq $approvedIds.session_id -and $event.data.turn_id -eq $approvedIds.turn_id -and $event.data.reason -eq 'failed') 'Reapproved turn completion was not delivered to the original subscription'
+    $sessions = Rpc 'tools/call' @{name='list_sessions';arguments=@{}}
+    Assert (@(($sessions.result.content[0].text | ConvertFrom-Json)).Count -eq 1) 'Reapproval created duplicate sessions'
     $null = Check-Turn 'error' 'failed'
     $unsubscribed = Rpc 'events/unsubscribe' @{name='turn.completed';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Assert ($null -eq $unsubscribed.error) 'Unsubscribe did not atomically replace subscriptions'
@@ -270,6 +297,7 @@ try {
     Write-Host 'PASS: explicit follow-up kept ACP session and context with distinct signed completions'
     Write-Host 'PASS: recovered history and result matched the original turn; explicit follow-up reused an unconfirmed session'
     Write-Host 'PASS: persisted subscription, atomic replacement, protected ACLs and denied ACP approval'
+    Write-Host 'PASS: exact-workspace revocation, readable history, blocked follow-up and reconnect, persisted revocation and idempotent reapproval'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {
     Stop-Scheduler
