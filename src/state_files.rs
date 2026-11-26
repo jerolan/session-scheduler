@@ -14,6 +14,7 @@ mod windows;
 pub enum StateFile {
     Subscriptions,
     PendingEvents,
+    Workspaces,
 }
 
 impl StateFile {
@@ -21,6 +22,7 @@ impl StateFile {
         match self {
             Self::Subscriptions => "event-subscriptions.json",
             Self::PendingEvents => "pending-events.json",
+            Self::Workspaces => "trusted-workspaces.json",
         }
     }
 }

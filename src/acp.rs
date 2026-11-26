@@ -376,6 +376,10 @@ impl AcpJob {
         if registry.stopping {
             return Err(io::Error::other("scheduler stopped"));
         }
+        let workspace = self.workspace.canonicalize()?;
+        if workspace != self.workspace || !workspace.is_dir() {
+            return Err(io::Error::other("workspace changed"));
+        }
         let mut child = command
             .current_dir(&self.workspace)
             .env_remove("CODEX_CONFIG")

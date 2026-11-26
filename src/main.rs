@@ -4,12 +4,13 @@ mod http;
 mod state_files;
 use acp::{AcpJob, Start};
 use events::TurnEvent;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     io::{self, BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin},
     sync::{mpsc, Arc, Mutex},
     thread,
@@ -320,8 +321,37 @@ fn launch(mut job: Launch) {
         }
     }
 }
+struct Attempt {
+    original: PathBuf,
+    workspace: PathBuf,
+    prompt: String,
+    kind: AgentKind,
+    executable: PathBuf,
+    completed: Option<Value>,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct WorkspaceDecisions {
+    approved: BTreeSet<PathBuf>,
+    revoked: BTreeSet<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedWorkspaceDecisions {
+    Decisions(WorkspaceDecisions),
+    Legacy(BTreeSet<PathBuf>),
+}
+
+#[derive(Default)]
+struct WorkspaceTrust {
+    decisions: WorkspaceDecisions,
+    attempts: BTreeMap<String, Attempt>,
+}
+
 struct State {
-    allowed: Vec<PathBuf>,
+    configured: Vec<PathBuf>,
+    workspace_trust: Mutex<WorkspaceTrust>,
+    trust_store: Option<state_files::StateFiles>,
     codex_command: Option<PathBuf>,
     opencode_command: Option<PathBuf>,
     sessions: Sessions,
@@ -341,7 +371,7 @@ impl Drop for State {
 }
 impl State {
     fn new(events: Option<Arc<events::Events>>) -> Self {
-        let allowed: Vec<PathBuf> = env::var_os("SESSION_SCHEDULER_WORKSPACES")
+        let configured: Vec<PathBuf> = env::var_os("SESSION_SCHEDULER_WORKSPACES")
             .map(|v| {
                 env::split_paths(&v)
                     .filter_map(|p| p.canonicalize().ok())
@@ -349,10 +379,42 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
+        let mut decisions = WorkspaceDecisions::default();
+        let mut trust_store = None;
+        if events.is_some() {
+            let loaded = (|| -> io::Result<_> {
+                let dir = env::var_os("SESSION_SCHEDULER_STATE_DIR")
+                    .ok_or_else(|| io::Error::other("state directory required"))?;
+                let store = state_files::StateFiles::open(PathBuf::from(dir))?;
+                let decisions = match store.read(state_files::StateFile::Workspaces)? {
+                    Some(file) => match serde_json::from_reader(file).map_err(io::Error::other)? {
+                        SavedWorkspaceDecisions::Decisions(decisions) => decisions,
+                        SavedWorkspaceDecisions::Legacy(approved) => WorkspaceDecisions {
+                            approved,
+                            ..WorkspaceDecisions::default()
+                        },
+                    },
+                    None => WorkspaceDecisions::default(),
+                };
+                Ok((store, decisions))
+            })();
+            match loaded {
+                Ok((store, saved)) => {
+                    trust_store = Some(store);
+                    decisions = saved;
+                }
+                Err(error) => eprintln!("workspace trust unavailable: {error}"),
+            }
+        }
         let executable =
             |name| env::var_os(name).and_then(|p| PathBuf::from(p).canonicalize().ok());
         Self {
-            allowed,
+            configured,
+            workspace_trust: Mutex::new(WorkspaceTrust {
+                decisions,
+                ..WorkspaceTrust::default()
+            }),
+            trust_store,
             codex_command: executable("SESSION_SCHEDULER_ACP_COMMAND"),
             opencode_command: executable("SESSION_SCHEDULER_OPENCODE_COMMAND"),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -362,13 +424,53 @@ impl State {
             events,
         }
     }
+    fn is_workspace_trusted(&self, decisions: &WorkspaceDecisions, workspace: &Path) -> bool {
+        (self.events.is_none() || self.trust_store.is_some())
+            && !decisions.revoked.contains(workspace)
+            && (decisions.approved.contains(workspace)
+                || self.configured.iter().any(|path| path == workspace))
+    }
+
+    fn session_workspace(
+        &self,
+        decisions: &WorkspaceDecisions,
+        record: &Value,
+    ) -> Result<PathBuf, Value> {
+        let workspace = record["workspace"]
+            .as_str()
+            .map(Path::new)
+            .filter(|path| path.canonicalize().is_ok_and(|p| p == *path && p.is_dir()))
+            .ok_or_else(|| result(json!("Workspace is not allowed"), true))?;
+        if !self.is_workspace_trusted(decisions, workspace) {
+            return Err(result(
+                json!({"status":"workspace_not_trusted", "workspace":workspace}),
+                true,
+            ));
+        }
+        Ok(workspace.to_owned())
+    }
+
+    fn save_workspace_decisions(&self, decisions: &WorkspaceDecisions) -> Result<(), Value> {
+        let store = self
+            .trust_store
+            .as_ref()
+            .ok_or_else(|| result(json!("Workspace trust store unavailable"), true))?;
+        store
+            .replace(state_files::StateFile::Workspaces, |file| {
+                serde_json::to_writer(file, decisions).map_err(io::Error::other)
+            })
+            .map_err(|_| result(json!("Could not save workspace trust"), true))
+    }
+
     fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
         let Some(workspace) = args["workspace"]
             .as_str()
-            .and_then(|p| PathBuf::from(p).canonicalize().ok())
-            .filter(|p| self.allowed.contains(p))
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .and_then(|p| p.canonicalize().ok())
+            .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
         else {
-            return (result(json!("Workspace is not allowed"), true), None);
+            return (result(json!({"status":"invalid_workspace"}), true), None);
         };
         let (kind, executable) = match args.get("agent") {
             None => (AgentKind::Codex, &self.codex_command),
@@ -383,6 +485,48 @@ impl State {
             return (result(json!("Adapter or prompt unavailable"), true), None);
         };
 
+        // Serialize admission with revocation until the session or turn is reserved.
+        let mut trust = self.workspace_trust.lock().unwrap();
+        if !self.is_workspace_trusted(&trust.decisions, &workspace) {
+            if self.events.is_none() {
+                return (result(json!("Workspace is not allowed"), true), None);
+            }
+            if self.trust_store.is_none() {
+                return (
+                    result(json!("Workspace trust store unavailable"), true),
+                    None,
+                );
+            }
+            let attempt_id = Uuid::new_v4().to_string();
+            trust.attempts.insert(
+                attempt_id.clone(),
+                Attempt {
+                    original: PathBuf::from(args["workspace"].as_str().unwrap()),
+                    workspace: workspace.clone(),
+                    prompt: prompt.to_owned(),
+                    kind,
+                    executable,
+                    completed: None,
+                },
+            );
+            return (
+                result(
+                    json!({"status":"approval_required", "workspace":workspace, "attempt_id":attempt_id}),
+                    false,
+                ),
+                None,
+            );
+        }
+
+        self.start_delegate(workspace, kind, executable, prompt.to_owned())
+    }
+    fn start_delegate(
+        &self,
+        workspace: PathBuf,
+        kind: AgentKind,
+        executable: PathBuf,
+        prompt: String,
+    ) -> (Value, Option<Launch>) {
         let sid = Uuid::new_v4().to_string();
         let tid = Uuid::new_v4().to_string();
         let record = json!({
@@ -421,10 +565,80 @@ impl State {
             Some(job),
         )
     }
+    fn approve_workspace(&self, args: &Value) -> Value {
+        let mut trust = self.workspace_trust.lock().unwrap();
+        let WorkspaceTrust {
+            decisions,
+            attempts,
+        } = &mut *trust;
+        let Some(attempt) = args["attempt_id"]
+            .as_str()
+            .and_then(|id| attempts.get_mut(id))
+        else {
+            return result(json!("Attempt not found"), true);
+        };
+        if let Some(response) = &attempt.completed {
+            return response.clone();
+        }
+        if !attempt
+            .original
+            .canonicalize()
+            .ok()
+            .is_some_and(|p| p == attempt.workspace && p.is_dir() && std::fs::read_dir(p).is_ok())
+        {
+            return result(json!({"status":"invalid_workspace"}), true);
+        }
+        let mut updated = decisions.clone();
+        updated.revoked.remove(&attempt.workspace);
+        updated.approved.insert(attempt.workspace.clone());
+        if let Err(error) = self.save_workspace_decisions(&updated) {
+            return error;
+        }
+        *decisions = updated;
+        let (response, job) = self.start_delegate(
+            attempt.workspace.clone(),
+            attempt.kind,
+            attempt.executable.clone(),
+            attempt.prompt.clone(),
+        );
+        if response["isError"] == false {
+            attempt.completed = Some(response.clone());
+            if let Some(job) = job {
+                launch(job);
+            }
+        }
+        response
+    }
+    fn revoke_workspace(&self, args: &Value) -> Value {
+        let Some(workspace) = args["workspace"]
+            .as_str()
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_dir())
+        else {
+            return result(json!({"status":"invalid_workspace"}), true);
+        };
+        let mut trust = self.workspace_trust.lock().unwrap();
+        let mut updated = trust.decisions.clone();
+        updated.approved.remove(&workspace);
+        if updated.revoked.insert(workspace.clone()) {
+            if let Err(error) = self.save_workspace_decisions(&updated) {
+                return error;
+            }
+            trust.decisions = updated;
+        }
+        trust
+            .attempts
+            .retain(|_, attempt| attempt.workspace != workspace || attempt.completed.is_some());
+        result(json!({"status":"revoked", "workspace":workspace}), false)
+    }
+
     fn reconnect_session(&self, args: &Value) -> (Value, Option<Launch>) {
         let Some(id) = args["session_id"].as_str() else {
             return (result(json!("Session required"), true), None);
         };
+        let trust = self.workspace_trust.lock().unwrap();
         let mut sessions = self.sessions.lock().unwrap();
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
@@ -447,17 +661,9 @@ impl State {
                 None,
             );
         }
-        let Some(workspace) = record["workspace"]
-            .as_str()
-            .and_then(|p| PathBuf::from(p).canonicalize().ok())
-            .filter(|p| {
-                self.allowed.contains(p)
-                    && record["workspace"]
-                        .as_str()
-                        .is_some_and(|original| p == std::path::Path::new(original))
-            })
-        else {
-            return (result(json!("Workspace is not allowed"), true), None);
+        let workspace = match self.session_workspace(&trust.decisions, record) {
+            Ok(workspace) => workspace,
+            Err(error) => return (error, None),
         };
         let (kind, executable) = match record["agent"].as_str() {
             Some("codex") => (AgentKind::Codex, &self.codex_command),
@@ -523,6 +729,7 @@ impl State {
         ) else {
             return (result(json!("Session and prompt required"), true), None);
         };
+        let trust = self.workspace_trust.lock().unwrap();
         let mut sessions = self.sessions.lock().unwrap();
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
@@ -534,14 +741,8 @@ impl State {
         {
             return (result(json!("Session is not available"), true), None);
         }
-        if record["status"] == "unknown"
-            && !record["workspace"].as_str().is_some_and(|path| {
-                PathBuf::from(path).canonicalize().is_ok_and(|workspace| {
-                    workspace == std::path::Path::new(path) && workspace.is_dir()
-                })
-            })
-        {
-            return (result(json!("Workspace is not allowed"), true), None);
+        if let Err(error) = self.session_workspace(&trust.decisions, record) {
+            return (error, None);
         }
         let Some(sender) = self.workers.lock().unwrap().get(id).cloned() else {
             return (result(json!("Session is not available"), true), None);
@@ -696,9 +897,9 @@ impl State {
             }
             "ping" => json!({}),
             "tools/list" => {
-                json!({"tools":[{
+                let mut catalog = json!({"tools":[{
                     "name":"delegate",
-                    "description":"Delegate work to Codex or OpenCode",
+                    "description":"Delegate work to Codex or OpenCode. If approval_required, show the exact workspace to the user and ask for one explicit yes in this chat. Only after yes call approve_workspace with attempt_id; do nothing on denial or no response.",
                     "inputSchema":{
                         "type":"object",
                         "properties":{
@@ -708,7 +909,18 @@ impl State {
                         },
                         "required":["workspace","prompt"]
                     }
-                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
+                },{"name":"approve_workspace","description":"After the user explicitly approves the exact workspace in this chat, approve and continue the retained attempt. Retry with the same attempt_id if needed.","inputSchema":{"type":"object","properties":{"attempt_id":{"type":"string"}},"required":["attempt_id"]}},{"name":"revoke_workspace","description":"When the user asks to revoke trust, revoke it for the effective workspace. Existing history remains readable and active turns continue.","inputSchema":{"type":"object","properties":{"workspace":{"type":"string","description":"Absolute path to the workspace"}},"required":["workspace"]}},{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]});
+                if self.events.is_none() {
+                    catalog["tools"][0]["description"] =
+                        json!("Delegate work to Codex or OpenCode in a configured workspace");
+                    catalog["tools"].as_array_mut().unwrap().retain(|tool| {
+                        !matches!(
+                            tool["name"].as_str(),
+                            Some("approve_workspace" | "revoke_workspace")
+                        )
+                    });
+                }
+                catalog
             }
             "tools/call" => {
                 let args = &request["params"]["arguments"];
@@ -730,6 +942,8 @@ impl State {
                         Some(s) => result(s, false),
                         None => result(json!("Session not found"), true),
                     },
+                    "approve_workspace" if self.events.is_some() => self.approve_workspace(args),
+                    "revoke_workspace" if self.events.is_some() => self.revoke_workspace(args),
                     "cancel_turn" => self.cancel_turn(args),
                     "archive_session" => self.archive_session(args),
                     "reconnect_session" => {

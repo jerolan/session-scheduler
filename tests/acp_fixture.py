@@ -120,6 +120,12 @@ for line in sys.stdin:
             continue
         if prompt == 'complete_and_exit':
             Path('fixture.pid').write_text(str(os.getpid()))
+        if prompt == 'hold_turn':
+            Path('prompt-ready').touch()
+            deadline = time.monotonic() + 10
+            while not Path('release-turn').exists():
+                if time.monotonic() >= deadline: sys.exit(1)
+                time.sleep(.01)
         if prompt in ('wait_cancel', 'race_cancel'):
             print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':session_id,'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'before'}}}}), flush=True)
             Path('prompt-ready').write_text('ready')
