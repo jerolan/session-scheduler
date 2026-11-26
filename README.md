@@ -3,6 +3,28 @@
 Session Scheduler delega turnos a Codex CLI y OpenCode mediante ACP y ofrece el evento
 `turn.completed` para avisar a Dot cuando el turno tiene un desenlace confirmado.
 
+## Confianza del workspace por MCP
+
+En el MCP HTTP autenticado, `delegate` recibe una ruta absoluta a una carpeta
+existente. Si todavía no es de confianza, devuelve `approval_required`, la
+ruta efectiva y un `attempt_id`, sin iniciar una sesión. El solicitante muestra
+esa ruta y pide un único «sí» explícito en el chat. Tras recibirlo, llama a
+`approve_workspace` con el `attempt_id`; la herramienta guarda la confianza y
+continúa el encargo original. Ante una negativa o ausencia de respuesta no se
+llama a la herramienta. Una ruta inválida o inaccesible devuelve
+`invalid_workspace`.
+
+La confianza se guarda en el directorio privado de estado y sobrevive al
+reinicio. Se aplica solo a la carpeta efectiva exacta, sin incluir otras
+carpetas. La configuración `SESSION_SCHEDULER_WORKSPACES` sigue autorizando
+solo las rutas configuradas mientras esté vigente; no se copia al almacén de
+confianza. Los intentos pendientes y las referencias a los ya iniciados viven
+solo durante el proceso. Mientras siga activo, repetir `approve_workspace`
+con el mismo ID devuelve los mismos IDs de sesión y turno sin volver a lanzar
+el encargo. Tras un reinicio hay que iniciar un nuevo intento. El transporte
+stdio conserva el acceso limitado a los workspaces configurados y no ofrece
+la herramienta de aprobación.
+
 ## Selección de agente por MCP
 
 La herramienta `delegate` recibe `workspace`, `prompt` y el campo opcional
@@ -13,8 +35,8 @@ ha abierto.
 
 Configura `SESSION_SCHEDULER_OPENCODE_COMMAND` en el proceso del scheduler
 con la ruta al ejecutable de OpenCode. El scheduler le pasa el argumento
-`acp` y abre la sesión en el workspace autorizado por
-`SESSION_SCHEDULER_WORKSPACES`. OpenCode usa la política de permisos
+`acp` y abre la sesión en el workspace exacto autorizado por configuración o por el MCP
+HTTP autenticado. OpenCode usa la política de permisos
 del entorno que lo ejecuta. El scheduler cancela las solicitudes ACP de
 permiso interactivo de ambos agentes. Codex sigue usando
 `SESSION_SCHEDULER_ACP_COMMAND`.

@@ -320,8 +320,19 @@ fn launch(mut job: Launch) {
         }
     }
 }
+struct Attempt {
+    original: PathBuf,
+    workspace: PathBuf,
+    prompt: String,
+    kind: AgentKind,
+    executable: PathBuf,
+    completed: Option<Value>,
+}
 struct State {
-    allowed: Vec<PathBuf>,
+    configured: Vec<PathBuf>,
+    allowed: Mutex<Vec<PathBuf>>,
+    trust_store: Option<state_files::StateFiles>,
+    attempts: Mutex<BTreeMap<String, Attempt>>,
     codex_command: Option<PathBuf>,
     opencode_command: Option<PathBuf>,
     sessions: Sessions,
@@ -349,10 +360,36 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
+        let configured = allowed;
+        let mut allowed = Vec::new();
+        let mut trust_store = None;
+        if events.is_some() {
+            let loaded = (|| -> io::Result<_> {
+                let dir = env::var_os("SESSION_SCHEDULER_STATE_DIR")
+                    .ok_or_else(|| io::Error::other("state directory required"))?;
+                let store = state_files::StateFiles::open(PathBuf::from(dir))?;
+                let paths = match store.read(state_files::StateFile::Workspaces)? {
+                    Some(file) => serde_json::from_reader::<_, Vec<PathBuf>>(file)
+                        .map_err(io::Error::other)?,
+                    None => Vec::new(),
+                };
+                Ok((store, paths))
+            })();
+            match loaded {
+                Ok((store, paths)) => {
+                    trust_store = Some(store);
+                    allowed = paths;
+                }
+                Err(error) => eprintln!("workspace trust unavailable: {error}"),
+            }
+        }
         let executable =
             |name| env::var_os(name).and_then(|p| PathBuf::from(p).canonicalize().ok());
         Self {
-            allowed,
+            configured,
+            allowed: Mutex::new(allowed),
+            trust_store,
+            attempts: Mutex::new(BTreeMap::new()),
             codex_command: executable("SESSION_SCHEDULER_ACP_COMMAND"),
             opencode_command: executable("SESSION_SCHEDULER_OPENCODE_COMMAND"),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -365,10 +402,12 @@ impl State {
     fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
         let Some(workspace) = args["workspace"]
             .as_str()
-            .and_then(|p| PathBuf::from(p).canonicalize().ok())
-            .filter(|p| self.allowed.contains(p))
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .and_then(|p| p.canonicalize().ok())
+            .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
         else {
-            return (result(json!("Workspace is not allowed"), true), None);
+            return (result(json!({"status":"invalid_workspace"}), true), None);
         };
         let (kind, executable) = match args.get("agent") {
             None => (AgentKind::Codex, &self.codex_command),
@@ -383,6 +422,48 @@ impl State {
             return (result(json!("Adapter or prompt unavailable"), true), None);
         };
 
+        if !self.configured.contains(&workspace)
+            && !self.allowed.lock().unwrap().contains(&workspace)
+        {
+            if self.events.is_none() {
+                return (result(json!("Workspace is not allowed"), true), None);
+            }
+            if self.trust_store.is_none() {
+                return (
+                    result(json!("Workspace trust store unavailable"), true),
+                    None,
+                );
+            }
+            let attempt_id = Uuid::new_v4().to_string();
+            self.attempts.lock().unwrap().insert(
+                attempt_id.clone(),
+                Attempt {
+                    original: PathBuf::from(args["workspace"].as_str().unwrap()),
+                    workspace: workspace.clone(),
+                    prompt: prompt.to_owned(),
+                    kind,
+                    executable,
+                    completed: None,
+                },
+            );
+            return (
+                result(
+                    json!({"status":"approval_required", "workspace":workspace, "attempt_id":attempt_id}),
+                    false,
+                ),
+                None,
+            );
+        }
+
+        self.start_delegate(workspace, kind, executable, prompt.to_owned())
+    }
+    fn start_delegate(
+        &self,
+        workspace: PathBuf,
+        kind: AgentKind,
+        executable: PathBuf,
+        prompt: String,
+    ) -> (Value, Option<Launch>) {
         let sid = Uuid::new_v4().to_string();
         let tid = Uuid::new_v4().to_string();
         let record = json!({
@@ -421,6 +502,57 @@ impl State {
             Some(job),
         )
     }
+    fn approve_workspace(&self, args: &Value) -> Value {
+        let mut attempts = self.attempts.lock().unwrap();
+        let Some(attempt) = args["attempt_id"]
+            .as_str()
+            .and_then(|id| attempts.get_mut(id))
+        else {
+            return result(json!("Attempt not found"), true);
+        };
+        if let Some(response) = &attempt.completed {
+            return response.clone();
+        }
+        if !attempt
+            .original
+            .canonicalize()
+            .ok()
+            .is_some_and(|p| p == attempt.workspace && p.is_dir() && std::fs::read_dir(p).is_ok())
+        {
+            return result(json!({"status":"invalid_workspace"}), true);
+        }
+        let Some(store) = &self.trust_store else {
+            return result(json!("Workspace trust store unavailable"), true);
+        };
+        let mut allowed = self.allowed.lock().unwrap();
+        let mut updated = allowed.clone();
+        if !updated.contains(&attempt.workspace) {
+            updated.push(attempt.workspace.clone());
+        }
+        if store
+            .replace(state_files::StateFile::Workspaces, |file| {
+                serde_json::to_writer(file, &updated).map_err(io::Error::other)
+            })
+            .is_err()
+        {
+            return result(json!("Could not save workspace trust"), true);
+        }
+        *allowed = updated;
+        drop(allowed);
+        let (response, job) = self.start_delegate(
+            attempt.workspace.clone(),
+            attempt.kind,
+            attempt.executable.clone(),
+            attempt.prompt.clone(),
+        );
+        if response["isError"] == false {
+            attempt.completed = Some(response.clone());
+            if let Some(job) = job {
+                launch(job);
+            }
+        }
+        response
+    }
     fn reconnect_session(&self, args: &Value) -> (Value, Option<Launch>) {
         let Some(id) = args["session_id"].as_str() else {
             return (result(json!("Session required"), true), None);
@@ -451,7 +583,7 @@ impl State {
             .as_str()
             .and_then(|p| PathBuf::from(p).canonicalize().ok())
             .filter(|p| {
-                self.allowed.contains(p)
+                (self.configured.contains(p) || self.allowed.lock().unwrap().contains(p))
                     && record["workspace"]
                         .as_str()
                         .is_some_and(|original| p == std::path::Path::new(original))
@@ -696,9 +828,9 @@ impl State {
             }
             "ping" => json!({}),
             "tools/list" => {
-                json!({"tools":[{
+                let mut catalog = json!({"tools":[{
                     "name":"delegate",
-                    "description":"Delegate work to Codex or OpenCode",
+                    "description":"Delegate work to Codex or OpenCode. If approval_required, show the exact workspace to the user and ask for one explicit yes in this chat. Only after yes call approve_workspace with attempt_id; do nothing on denial or no response.",
                     "inputSchema":{
                         "type":"object",
                         "properties":{
@@ -708,7 +840,16 @@ impl State {
                         },
                         "required":["workspace","prompt"]
                     }
-                },{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]})
+                },{"name":"approve_workspace","description":"After the user explicitly approves the exact workspace in this chat, approve and continue the retained attempt. Retry with the same attempt_id if needed.","inputSchema":{"type":"object","properties":{"attempt_id":{"type":"string"}},"required":["attempt_id"]}},{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]});
+                if self.events.is_none() {
+                    catalog["tools"][0]["description"] =
+                        json!("Delegate work to Codex or OpenCode in a configured workspace");
+                    catalog["tools"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|tool| tool["name"] != "approve_workspace");
+                }
+                catalog
             }
             "tools/call" => {
                 let args = &request["params"]["arguments"];
@@ -730,6 +871,7 @@ impl State {
                         Some(s) => result(s, false),
                         None => result(json!("Session not found"), true),
                     },
+                    "approve_workspace" if self.events.is_some() => self.approve_workspace(args),
                     "cancel_turn" => self.cancel_turn(args),
                     "archive_session" => self.archive_session(args),
                     "reconnect_session" => {
