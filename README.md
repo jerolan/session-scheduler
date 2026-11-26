@@ -60,6 +60,20 @@ del entorno que lo ejecuta. El scheduler cancela las solicitudes ACP de
 permiso interactivo de ambos agentes. Codex sigue usando
 `SESSION_SCHEDULER_ACP_COMMAND`.
 
+## Importar una sesión nativa por MCP
+
+En el MCP HTTP autenticado, llama a `import_session` con `agent` (`codex` u
+`opencode`), `native_session_id` (el ID de una sesión existente) y `workspace`
+(la ruta absoluta de un workspace de confianza). El Scheduler devuelve el
+mismo `session_id` para el mismo agente, ID nativo y workspace efectivo, incluso
+después de reiniciar.
+
+Consulta el registro con `list_sessions` e `inspect_session`. Si el Scheduler ya
+conoce la sesión, conserva su estado. Una referencia nueva queda en
+`pending_confirmation` y bloquea los envíos y la reconexión. La importación
+solo registra la referencia y prescinde de lanzar el agente o leer su
+conversación.
+
 ## Encargo de seguimiento por MCP
 
 Para un encargo adicional explícito del usuario, llama a `follow_up` con el
@@ -82,13 +96,11 @@ Cuando el turno alcance un desenlace confirmado, llama a `archive_session`
 con el `session_id`. La sesión sale de `list_sessions` y sigue disponible
 en `inspect_session` con `archived: true`, su historial y su desenlace.
 
-El registro de sesiones vive en la memoria del proceso. Los IDs devueltos
-permiten listar e inspeccionar las sesiones durante esa ejecución, pero el
-registro se pierde al reiniciar el scheduler. La cola de eventos pendientes se
-conserva por separado y continúa sus reintentos tras el reinicio, con los
-IDs originales. La persistencia del registro de sesiones corresponde a
-[#12](https://github.com/jerolan/session-scheduler/issues/12), posterior al
-alcance actual.
+El MCP HTTP conserva los metadatos del registro de sesiones en SQLite.
+Tras reiniciar, la inspección conserva los identificadores y el último estado
+conocido. El historial y los resultados observados durante la ejecución viven
+en memoria. La cola de eventos pendientes se conserva por separado y continúa
+sus reintentos con los IDs originales.
 
 ## Recuperación de un turno interrumpido
 

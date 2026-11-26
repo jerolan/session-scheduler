@@ -1,4 +1,5 @@
 import base64, hashlib, hmac, http.client, json, os, queue, socket, sqlite3, subprocess, tempfile, threading, time, unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +42,81 @@ class RecoveringReceiver(Receiver):
 
 
 class HttpEvents(unittest.TestCase):
+    def test_import_native_session_is_scoped_durable_and_nonexecuting(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            other = Path(root, 'other'); other.mkdir()
+            alias = Path(root, 'alias'); alias.symlink_to(project, target_is_directory=True)
+            adapter_started = Path(root, 'adapter-started')
+            adapter = Path(root, 'adapter')
+            adapter.write_text(f'#!/bin/sh\ntouch "{adapter_started}"\n')
+            adapter.chmod(0o700)
+            args = {'agent': 'opencode', 'native_session_id': 'ses_outside',
+                    'workspace': str(project)}
+            configured = os.pathsep.join(map(str, (project, other)))
+            with self.workspace_mcp(state, configured, adapter) as (rpc, call):
+                self.assertIn('import_session', [t['name'] for t in rpc('tools/list', {})['tools']])
+                rpc('tools/call', {'name': 'import_session', 'arguments': args}, authenticated=False)
+                self.assertEqual(call('list_sessions', {}), (False, []))
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    imports = list(pool.map(lambda _: call('import_session', args), range(4)))
+                error, imported = imports[0]
+                self.assertFalse(error, imported)
+                self.assertEqual(imports, [(False, imported)] * 4)
+                session_id = {'session_id': imported['session_id']}
+                self.assertEqual(imported['status'], 'pending_confirmation')
+                self.assertEqual(call('import_session', dict(args, workspace=str(alias))), (False, imported))
+                scoped_ids = {imported['session_id']}
+                for scoped_args in (dict(args, agent='codex'), dict(args, workspace=str(other))):
+                    error, scoped = call('import_session', scoped_args)
+                    self.assertFalse(error, scoped)
+                    scoped_ids.add(scoped['session_id'])
+                self.assertEqual(len(scoped_ids), 3)
+                self.assertTrue(call('import_session', dict(args, native_session_id=' '))[0])
+                self.assertTrue(call('import_session', dict(args, agent='unknown'))[0])
+                self.assertEqual(len(call('list_sessions', {})[1]), 3)
+                for tool, extra in (('follow_up', {'prompt': 'blocked prompt'}), ('reconnect_session', {})):
+                    self.assertTrue(call(tool, dict(session_id, **extra))[0])
+
+            with self.workspace_mcp(state, configured, adapter) as (_, call):
+                self.assertEqual(call('import_session', args), (False, imported))
+                self.assertIn(dict(session_id, workspace=str(project), turn_id=None,
+                                   status='pending_confirmation'), call('list_sessions', {})[1])
+                error, record = call('inspect_session', session_id)
+                self.assertFalse(error)
+                self.assertEqual(record['agent'], 'opencode')
+                self.assertEqual(record['acp_session_id'], args['native_session_id'])
+                self.assertEqual(record['status'], 'pending_confirmation')
+                self.assertIsNone(record['turn_id'])
+                self.assertIsNone(record['stop_reason'])
+                self.assertEqual(record['history'], [])
+                for tool, extra in (('follow_up', {'prompt': 'blocked prompt'}),
+                                    ('reconnect_session', {'turn_id': 'external-turn'})):
+                    self.assertTrue(call(tool, dict(session_id, **extra))[0])
+                call('revoke_workspace', {'workspace': str(project)})
+                self.assertEqual(call('import_session', args),
+                                 (True, {'status': 'workspace_not_trusted', 'workspace': str(project)}))
+                self.assertEqual(call('inspect_session', session_id), (False, record))
+            self.assertFalse(adapter_started.exists())
+
+    def test_import_preserves_observed_outcome_without_emitting_turn_events(self):
+        with self.recovery_mcp() as (state, call, expect_event, receiver):
+            error, ids = call('delegate', {'workspace': state, 'prompt': 'hello'})
+            self.assertFalse(error)
+            expect_event('turn.completed', ids, 'end_turn')
+            observed = self.workspace_session(call, ids, 'completed')
+            args = {'agent': 'codex', 'workspace': state,
+                    'native_session_id': observed['acp_session_id']}
+            self.assertEqual(call('import_session', args),
+                             (False, {'session_id': ids['session_id'], 'status': 'completed'}))
+            self.assertEqual(call('inspect_session', ids), (False, observed))
+            error, imported = call('import_session', dict(args, native_session_id='external-session'))
+            self.assertFalse(error, imported)
+            self.assertEqual(imported['status'], 'pending_confirmation')
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=.5)
+
     def test_session_registry_survives_restart(self):
         with tempfile.TemporaryDirectory() as root:
             state = Path(root, 'state'); state.mkdir(mode=0o700)
@@ -121,7 +197,7 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(call('delegate', {'workspace':str(configured), 'prompt':'hello'})[1]['status'], 'approval_required')
 
     @contextmanager
-    def workspace_mcp(self, state, configured):
+    def workspace_mcp(self, state, configured, adapter=FIXTURE):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
@@ -130,7 +206,8 @@ class HttpEvents(unittest.TestCase):
                    SESSION_SCHEDULER_ACCOUNT='test-account',
                    SESSION_SCHEDULER_STATE_DIR=str(state),
                    SESSION_SCHEDULER_WORKSPACES=str(configured),
-                   SESSION_SCHEDULER_ACP_COMMAND=FIXTURE)
+                   SESSION_SCHEDULER_ACP_COMMAND=str(adapter),
+                   SESSION_SCHEDULER_OPENCODE_COMMAND=str(adapter))
 
         def rpc(method, params, authenticated=True):
             headers = {'Content-Type': 'application/json'}

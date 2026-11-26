@@ -126,6 +126,15 @@ enum Work {
     Reconnect { turn_id: String },
 }
 
+fn resolve_workspace(args: &Value) -> Option<PathBuf> {
+    args["workspace"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .and_then(|p| p.canonicalize().ok())
+        .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
+}
+
 fn result(value: Value, error: bool) -> Value {
     json!({"content":[{"type":"text", "text":value.to_string()}], "isError":error})
 }
@@ -492,14 +501,60 @@ impl State {
             .map_err(|_| result(json!("Could not save workspace trust"), true))
     }
 
-    fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
-        let Some(workspace) = args["workspace"]
+    fn import_session(&self, args: &Value) -> Value {
+        let Some(agent @ ("codex" | "opencode")) = args["agent"].as_str() else {
+            return result(json!("Unknown agent"), true);
+        };
+        let Some(native_id) = args["native_session_id"]
             .as_str()
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .and_then(|p| p.canonicalize().ok())
-            .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
+            .filter(|id| !id.is_empty() && id.trim() == *id && !id.chars().any(char::is_control))
         else {
+            return result(json!("A native session ID is required"), true);
+        };
+        let Some(workspace) = resolve_workspace(args) else {
+            return result(json!({"status":"invalid_workspace"}), true);
+        };
+        let trust = self.workspace_trust.lock().unwrap();
+        if !self.is_workspace_trusted(&trust.decisions, &workspace) {
+            return result(
+                json!({"status":"workspace_not_trusted", "workspace":workspace}),
+                true,
+            );
+        }
+
+        let workspace = json!(workspace);
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(record) = sessions.values().find(|record| {
+            record["agent"] == agent
+                && record["acp_session_id"] == native_id
+                && record["workspace"] == workspace
+        }) {
+            return result(
+                json!({"session_id":record["session_id"], "status":record["status"]}),
+                false,
+            );
+        }
+
+        // The supplied reference alone gives us no evidence of an observed turn.
+        let id = Uuid::new_v4().to_string();
+        sessions.insert(
+            id.clone(),
+            json!({
+                "session_id":id, "turn_id":null, "workspace":workspace, "agent":agent,
+                "status":"pending_confirmation", "restart_blocked":true,
+                "acp_session_id":native_id, "stop_reason":null, "archived":false,
+                "history":[], "result":""
+            }),
+        );
+        drop(sessions);
+        result(
+            json!({"session_id":id, "status":"pending_confirmation"}),
+            false,
+        )
+    }
+
+    fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
+        let Some(workspace) = resolve_workspace(args) else {
             return (result(json!({"status":"invalid_workspace"}), true), None);
         };
         let (kind, executable) = match args.get("agent") {
@@ -944,6 +999,21 @@ impl State {
                         "required":["workspace","prompt"]
                     }
                 },{"name":"approve_workspace","description":"After the user explicitly approves the exact workspace in this chat, approve and continue the retained attempt. Retry with the same attempt_id if needed.","inputSchema":{"type":"object","properties":{"attempt_id":{"type":"string"}},"required":["attempt_id"]}},{"name":"revoke_workspace","description":"When the user asks to revoke trust, revoke it for the effective workspace. Existing history remains readable and active turns continue.","inputSchema":{"type":"object","properties":{"workspace":{"type":"string","description":"Absolute path to the workspace"}},"required":["workspace"]}},{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]});
+                if self.events.is_some() {
+                    catalog["tools"].as_array_mut().unwrap().push(json!({
+                        "name":"import_session",
+                        "description":"Register an explicitly supplied Codex or OpenCode native session ID in a trusted workspace without launching the agent. A new reference remains pending confirmation.",
+                        "inputSchema":{
+                            "type":"object",
+                            "properties":{
+                                "agent":{"type":"string","enum":["codex","opencode"]},
+                                "native_session_id":{"type":"string"},
+                                "workspace":{"type":"string","description":"Absolute path to the workspace"}
+                            },
+                            "required":["agent","native_session_id","workspace"]
+                        }
+                    }));
+                }
                 if self.events.is_none() {
                     catalog["tools"][0]["description"] =
                         json!("Delegate work to Codex or OpenCode in a configured workspace");
@@ -978,6 +1048,7 @@ impl State {
                     },
                     "approve_workspace" if self.events.is_some() => self.approve_workspace(args),
                     "revoke_workspace" if self.events.is_some() => self.revoke_workspace(args),
+                    "import_session" if self.events.is_some() => self.import_session(args),
                     "cancel_turn" => self.cancel_turn(args),
                     "archive_session" => self.archive_session(args),
                     "reconnect_session" => {
