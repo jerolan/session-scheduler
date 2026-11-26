@@ -69,10 +69,12 @@ mismo `session_id` para el mismo agente, ID nativo y workspace efectivo, incluso
 después de reiniciar.
 
 Consulta el registro con `list_sessions` e `inspect_session`. Si el Scheduler ya
-conoce la sesión, conserva su estado. Una referencia nueva queda en
-`pending_confirmation` y bloquea los envíos y la reconexión. La importación
-solo registra la referencia y prescinde de lanzar el agente o leer su
-conversación.
+conoce la sesión, conserva su estado. Antes de guardar una referencia nueva,
+el Scheduler pide al proveedor evidencia de que el ID existe en el workspace.
+Si el proveedor no puede verificar ambos, la importación devuelve un error.
+Una referencia verificada queda en `pending_confirmation` hasta comprobar el
+estado de la sesión. Mientras tanto, se bloquean los envíos y la reconexión.
+La importación no abre otra sesión ni envía un mensaje.
 
 ## Encargo de seguimiento por MCP
 
@@ -96,7 +98,10 @@ confirmado por el agente, incluido `end_turn` si el turno termina normalmente.
 
 Cuando el turno alcance un desenlace confirmado, llama a `archive_session`
 con el `session_id`. La sesión sale de `list_sessions` y sigue disponible
-en `inspect_session` con `archived: true`, su historial y su desenlace.
+en `inspect_session` con `archived: true`, su historial y su desenlace. Para
+una sesión de OpenCode gestionada por el Scheduler, el archivado espera el
+cierre del proceso de OpenCode. Si el cierre no se confirma, la sesión sigue
+visible y se puede volver a intentar el archivado.
 
 El MCP HTTP conserva los metadatos del registro de sesiones en SQLite.
 Tras reiniciar, la inspección conserva los identificadores y el último estado

@@ -243,6 +243,41 @@ fn reconcile_history(record: &mut Value, turn_id: &str, replayed: &[Value]) {
     }
 }
 
+fn provider_workspace(workspace: &Path) -> std::borrow::Cow<'_, str> {
+    let path = workspace.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{}", unc).into();
+        }
+        if let Some(local) = path.strip_prefix(r"\\?\") {
+            return local.to_owned().into();
+        }
+    }
+    path
+}
+
+pub(super) fn matches_provider_workspace(cwd: &Value, workspace: &Path) -> bool {
+    let Some(reported) = cwd.as_str() else {
+        return false;
+    };
+    let reported = Path::new(reported);
+    if !reported.is_absolute() {
+        return false;
+    }
+    if reported == workspace {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Limit filesystem access to spellings of the requested workspace.
+        provider_workspace(reported).eq_ignore_ascii_case(&provider_workspace(workspace))
+            && reported.canonicalize().is_ok_and(|path| path == workspace)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 pub(super) enum Start {
     New(Turn),
     Reconnect {
@@ -468,6 +503,77 @@ impl Adapter {
             output,
             deadline: None,
         })
+    }
+
+    pub(super) fn exists_in_workspace(
+        &self,
+        children: &Weak<Mutex<ChildRegistry>>,
+        workspace: &Path,
+        native_id: &str,
+    ) -> io::Result<bool> {
+        let mut connection =
+            self.connect(children, &uuid::Uuid::new_v4().to_string(), workspace)?;
+        let (done, deadline) = mpsc::channel();
+        let child = connection.child.clone();
+        let expires = Instant::now() + RECOVERY_TIMEOUT;
+        connection.deadline = Some(expires);
+        let watchdog = thread::spawn(move || {
+            if deadline
+                .recv_timeout(expires.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
+                let _ = child.lock().unwrap().kill();
+            }
+        });
+        let found = (|| {
+            let initialized = connection.initialize()?;
+            if !initialized["agentCapabilities"]["sessionCapabilities"]["list"].is_object() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "ACP session listing is unsupported",
+                ));
+            }
+            let requested_cwd = provider_workspace(workspace);
+            let mut cursor: Option<String> = None;
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let mut params = json!({"cwd":requested_cwd});
+                if let Some(value) = &cursor {
+                    params["cursor"] = json!(value);
+                }
+                connection.send(
+                    json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":params}),
+                )?;
+                let page = connection
+                    .response(&json!(2), |_| {})?
+                    .ok_or_else(|| io::Error::other("ACP session listing failed"))?;
+                let entries = page["sessions"]
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("Invalid ACP session listing"))?;
+                if entries.iter().any(|entry| {
+                    entry["sessionId"] == native_id
+                        && matches_provider_workspace(&entry["cwd"], workspace)
+                }) {
+                    return Ok(true);
+                }
+                match page.get("nextCursor") {
+                    None | Some(Value::Null) => return Ok(false),
+                    Some(Value::String(next)) if !next.is_empty() && seen.insert(next.clone()) => {
+                        cursor = Some(next.clone())
+                    }
+                    _ => return Err(io::Error::other("Invalid ACP session cursor")),
+                }
+            }
+        })();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        if Instant::now() >= expires {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ACP session listing timed out",
+            ));
+        }
+        found
     }
 
     pub(super) fn load(

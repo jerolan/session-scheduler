@@ -557,27 +557,92 @@ impl State {
             );
         }
 
-        let workspace = json!(workspace);
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(record) = sessions.values().find(|record| {
+        let workspace_json = json!(workspace);
+        let references_native = |record: &&Value| {
             record["agent"] == agent
                 && record["acp_session_id"] == native_id
-                && record["workspace"] == workspace
-        }) {
-            return result(
-                json!({"session_id":record["session_id"], "status":record["status"]}),
-                false,
-            );
+                && record["workspace"] == workspace_json
+        };
+        let sessions = self.sessions.lock().unwrap();
+        if let Some(record) = sessions.values().find(references_native) {
+            // Older builds could register a pending import without provider evidence.
+            if record["native_id_verified"] == true
+                || !record["turn_id"].is_null()
+                || record["status"] != "pending_confirmation"
+            {
+                return result(
+                    json!({"session_id":record["session_id"], "status":record["status"]}),
+                    false,
+                );
+            }
         }
 
-        // The supplied reference alone gives us no evidence of an observed turn.
+        drop(sessions);
+        drop(trust);
+
+        let adapter = match self.session_adapter(&json!({"agent": agent})) {
+            Ok(adapter) => adapter,
+            Err(error) => return error,
+        };
+        match adapter.exists_in_workspace(&Arc::downgrade(&self.children), &workspace, native_id) {
+            Ok(true) => {}
+            Ok(false) => return result(json!({"status":"native_session_not_found"}), true),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                let loaded = adapter.load(
+                    &Arc::downgrade(&self.children),
+                    &Uuid::new_v4().to_string(),
+                    &workspace,
+                    native_id,
+                    None,
+                    |_| {},
+                );
+                let verified = loaded.as_ref().is_ok_and(|(_, evidence)| {
+                    let observation = &evidence["_meta"]["session-scheduler/sessionState"];
+                    observation["sessionId"] == native_id
+                        && acp::matches_provider_workspace(&observation["cwd"], &workspace)
+                });
+                if !verified {
+                    return result(
+                        json!({"status":"native_session_verification_unavailable"}),
+                        true,
+                    );
+                }
+            }
+            Err(_) => {
+                return result(
+                    json!({"status":"native_session_verification_unavailable"}),
+                    true,
+                )
+            }
+        }
+
+        let trust = self.workspace_trust.lock().unwrap();
+        if !self.is_workspace_trusted(&trust.decisions, &workspace) {
+            return result(
+                json!({"status":"workspace_not_trusted", "workspace":workspace}),
+                true,
+            );
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let existing = sessions
+            .values()
+            .find(references_native)
+            .and_then(|record| record["session_id"].as_str())
+            .map(str::to_owned);
+        if let Some(id) = existing {
+            let record = sessions.get_mut(&id).unwrap();
+            record["native_id_verified"] = json!(true);
+            return result(json!({"session_id": id, "status":record["status"]}), false);
+        }
+
+        // Existence supplies no evidence of an observed turn or current activity.
         let id = Uuid::new_v4().to_string();
         sessions.insert(
             id.clone(),
             json!({
                 "session_id":id, "turn_id":null, "workspace":workspace, "agent":agent,
                 "status":"pending_confirmation", "restart_blocked":true,
-                "acp_session_id":native_id, "stop_reason":null, "archived":false,
+                "acp_session_id":native_id, "native_id_verified":true, "stop_reason":null, "archived":false,
                 "history":[], "result":""
             }),
         );
@@ -1124,7 +1189,8 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if record["restart_blocked"] == true
+        if record["archiving"] == true
+            || record["restart_blocked"] == true
             || session_has_status(
                 record,
                 &["running", "cancelling", "completion_pending", "recovering"],
@@ -1220,20 +1286,37 @@ impl State {
             record["status"].as_str(),
             Some("completed" | "failed" | "cancelled")
         ) || record["archived"] == true
+            || record["archiving"] == true
             || record["unresolved_turn_ids"]
                 .as_array()
                 .is_some_and(|ids| !ids.is_empty())
         {
             return result(json!("Session cannot be archived"), true);
         }
+        if record["opencode_managed"] != true {
+            return self.finish_archive(id, record);
+        }
+
+        // Reserve this session while waiting for the owner without stalling other sessions.
+        record["archiving"] = json!(true);
+        drop(records);
+        let closed = opencode_owner::archive(id).is_ok();
+        let mut records = self.sessions.lock().unwrap();
+        let record = records.get_mut(id).unwrap();
+        record.as_object_mut().unwrap().remove("archiving");
+        if !closed {
+            return result(
+                json!("OpenCode owner shutdown could not be confirmed. Retry archive."),
+                true,
+            );
+        }
+        self.finish_archive(id, record)
+    }
+
+    fn finish_archive(&self, id: &str, record: &mut Value) -> Value {
         record["archived"] = json!(true);
         self.workers.lock().unwrap().remove(id);
         self.cancel_writers.lock().unwrap().remove(id);
-        let owned = record["opencode_managed"] == true;
-        drop(records);
-        if owned {
-            let _ = opencode_owner::archive(id);
-        }
         result(json!({"session_id":id,"archived":true}), false)
     }
     fn dispatch(&self, request: Value) -> (Option<Value>, Option<Launch>) {
@@ -1295,7 +1378,7 @@ impl State {
                     }));
                     catalog["tools"].as_array_mut().unwrap().push(json!({
                         "name":"import_session",
-                        "description":"Register an explicitly supplied Codex or OpenCode native session ID in a trusted workspace without launching the agent. A new reference remains pending confirmation.",
+                        "description":"Register an existing native session in a trusted workspace. Activity remains pending confirmation until independently verified.",
                         "inputSchema":{
                             "type":"object",
                             "properties":{

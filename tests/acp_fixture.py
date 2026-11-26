@@ -18,7 +18,14 @@ remembered_reply = None
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
-    if method == 'initialize': result = {'protocolVersion':1,'agentCapabilities':{'loadSession':True},'authMethods':[]}
+    if method == 'initialize': result = {'protocolVersion':1,'agentCapabilities':{'loadSession':True,'sessionCapabilities':{'list':{}}},'authMethods':[]}
+    elif method == 'session/list':
+        saved_path = Path('reconciliation-session')
+        entries = []
+        if saved_path.exists():
+            saved = json.loads(saved_path.read_text())
+            entries.append({'sessionId': saved['session'], 'cwd': str(Path.cwd())})
+        result = {'sessions': entries}
     elif method == 'session/new':
         memory = None
         result = {'sessionId':session_id}

@@ -136,7 +136,8 @@ fn registry_metadata(record: &Value) -> Value {
     json!({
         "session_id": record["session_id"], "turn_id": record["turn_id"],
         "workspace": record["workspace"], "agent": record["agent"],
-        "acp_session_id": record["acp_session_id"], "status": record["status"],
+        "acp_session_id": record["acp_session_id"], "native_id_verified": record["native_id_verified"],
+        "status": record["status"],
         "stop_reason": record["stop_reason"].as_str().filter(|reason| known_stop_reason(reason)),
         "opencode_managed": record["opencode_managed"],
         "archived": record["archived"], "unresolved_turn_ids": record["unresolved_turn_ids"],

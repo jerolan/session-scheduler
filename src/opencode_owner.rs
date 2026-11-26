@@ -102,21 +102,20 @@ fn authenticate_owner(
         .map_err(|_| unavailable())
 }
 
-fn open(directory: PathBuf, id: Uuid) -> io::Result<(BufReader<TcpStream>, TcpStream)> {
+fn open(directory: PathBuf, id: Uuid) -> io::Result<Option<(BufReader<TcpStream>, TcpStream)>> {
     let state = StateFiles::open(directory)?;
-    let file = state
-        .read(StateFile::OpenCodeOwner(id))?
-        .ok_or_else(unavailable)?;
+    let Some(file) = state.read(StateFile::OpenCodeOwner(id))? else {
+        return Ok(None);
+    };
     let endpoint: Endpoint = serde_json::from_reader(file).map_err(io::Error::other)?;
     let mut socket =
         TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, endpoint.port).into(), IO_TIMEOUT)?;
-    socket.set_read_timeout(Some(IO_TIMEOUT))?;
     socket.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(socket.try_clone()?);
+    reader.get_ref().set_read_timeout(Some(IO_TIMEOUT))?;
     authenticate_client(&endpoint, &mut reader, &mut socket)
         .map_err(|error| io::Error::other(format!("authenticate owner: {error}")))?;
-    socket.set_read_timeout(None)?;
-    Ok((reader, socket))
+    Ok(Some((reader, socket)))
 }
 
 fn bridge(
@@ -211,17 +210,44 @@ pub(super) fn observe(
 
 pub(super) fn archive(id: &str) -> io::Result<()> {
     let id = Uuid::parse_str(id).map_err(io::Error::other)?;
-    let (_, mut socket) = open(state_directory()?, id)?;
-    send(&mut socket, json!({"method":"owner/archive"}))
+    let directory = state_directory()?;
+    let response = (|| {
+        let Some((mut reader, mut socket)) = open(directory.clone(), id)? else {
+            return Ok(());
+        };
+        send(
+            &mut socket,
+            json!({"jsonrpc":"2.0","id":1,"method":"owner/archive"}),
+        )?;
+        let reply = message(&mut reader)?;
+        if reply["jsonrpc"] == "2.0" && reply["id"] == 1 && reply["result"]["archived"] == true {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
+    })();
+    // Cleanup can race a retry or finish after the client times out.
+    // The endpoint is removed only after the provider has exited.
+    if response.is_err()
+        && StateFiles::open(directory)?
+            .read(StateFile::OpenCodeOwner(id))?
+            .is_none()
+    {
+        return Ok(());
+    }
+    response
 }
 
 fn relay(directory: PathBuf, id: Uuid) -> io::Result<()> {
-    let (mut reader, mut socket) = open(directory, id)?;
-    let writer = socket.try_clone()?;
+    let (mut reader, mut socket) = open(directory, id)?.ok_or_else(unavailable)?;
+    // On Windows the cloned read handle retains its own handshake timeout.
+    reader.get_ref().set_read_timeout(None)?;
     // Exit on either EOF. The owner independently drains the original ACP request.
     thread::spawn(move || {
-        let _ = io::copy(&mut reader, &mut io::stdout().lock());
-        let _ = writer.shutdown(Shutdown::Both);
+        if let Err(error) = io::copy(&mut reader, &mut io::stdout().lock()) {
+            eprintln!("OpenCode relay output: {error}");
+        }
+        let _ = reader.get_ref().shutdown(Shutdown::Both);
         std::process::exit(0);
     });
     io::copy(&mut io::stdin().lock(), &mut socket)?;
@@ -232,7 +258,8 @@ struct OwnerState {
     busy: Option<String>,
     latest: Option<Completion>,
     admitted: BTreeSet<String>,
-    archived: bool,
+    closing: bool,
+    archive_reply: Option<TcpStream>,
 }
 
 struct Completion {
@@ -270,28 +297,31 @@ fn answer(output: &mut TcpStream, id: &Value, result: Option<Value>) -> io::Resu
 fn client(mut output: TcpStream, owner: Arc<Owner>, endpoint: Arc<Endpoint>) -> io::Result<()> {
     output.set_nonblocking(false)?;
     output.set_write_timeout(Some(IO_TIMEOUT))?;
-    output.set_read_timeout(Some(IO_TIMEOUT))?;
     let mut input = BufReader::new(output.try_clone()?);
+    input.get_ref().set_read_timeout(Some(IO_TIMEOUT))?;
     authenticate_owner(&endpoint, &mut input, &mut output)
         .map_err(|error| io::Error::other(format!("authenticate client: {error}")))?;
-    output.set_read_timeout(None)?;
+    input.get_ref().set_read_timeout(None)?;
     let mut attached_at: Option<Option<String>> = None;
     let mut sent_turn = None;
     while let Ok(request) = message(&mut input) {
         let id = &request["id"];
         let params = &request["params"];
         match request["method"].as_str() {
-            Some("owner/archive") => {
+            Some("owner/archive") if id == 1 => {
                 let mut state = owner.state.lock().unwrap();
-                if state.busy.is_none() {
-                    state.archived = true;
+                if state.busy.is_some() || state.archive_reply.is_some() {
+                    drop(state);
+                    return answer(&mut output, id, None);
                 }
+                state.closing = true;
+                state.archive_reply = Some(output);
                 return Ok(());
             }
             Some("initialize") => answer(&mut output, id, Some(json!({"protocolVersion":1})))?,
             Some("session/new") if params["cwd"] == json!(owner.workspace) => {
                 let state = owner.state.lock().unwrap();
-                if !state.admitted.is_empty() || state.archived {
+                if !state.admitted.is_empty() || state.closing {
                     answer(&mut output, id, None)?;
                     continue;
                 }
@@ -306,7 +336,7 @@ fn client(mut output: TcpStream, owner: Arc<Owner>, endpoint: Arc<Endpoint>) -> 
                     let state = owner.state.lock().unwrap();
                     let live = matches!(owner.provider.lock().unwrap().try_wait(), Ok(None));
                     state.latest.as_ref()
-                        .filter(|completion| completion.ordinary && live && state.busy.is_none() && !state.archived)
+                        .filter(|completion| completion.ordinary && live && state.busy.is_none() && !state.closing)
                         .map(|completion| {
                             attached_at = Some(Some(completion.turn.clone()));
                             let mut evidence = json!({"_meta":{"session-scheduler/sessionState":{
@@ -334,7 +364,7 @@ fn client(mut output: TcpStream, owner: Arc<Owner>, endpoint: Arc<Endpoint>) -> 
                 let mut state = owner.state.lock().unwrap();
                 let current = state.latest.as_ref().map(|completion| &completion.turn);
                 let previous = attached_at.as_ref().and_then(|previous| previous.as_ref());
-                if state.archived
+                if state.closing
                     || state.busy.is_some()
                     || previous != current
                     || (current.is_none() && !state.admitted.is_empty())
@@ -479,7 +509,8 @@ fn serve(directory: PathBuf, id: Uuid, workspace: PathBuf, executable: PathBuf) 
             busy: None,
             latest: None,
             admitted: BTreeSet::new(),
-            archived: false,
+            closing: false,
+            archive_reply: None,
         }),
     });
     let worker = owner.clone();
@@ -489,14 +520,25 @@ fn serve(directory: PathBuf, id: Uuid, workspace: PathBuf, executable: PathBuf) 
     })?;
     let expires = Instant::now() + START_TIMEOUT;
     loop {
-        {
-            let state = owner.state.lock().unwrap();
-            if state.archived || (state.admitted.is_empty() && Instant::now() >= expires) {
-                break;
+        let closing = {
+            let mut state = owner.state.lock().unwrap();
+            state.closing |= (state.admitted.is_empty() && Instant::now() >= expires)
+                || engine.is_finished()
+                || !matches!(provider.lock().unwrap().try_wait(), Ok(None));
+            state.closing
+        };
+        if closing {
+            let closed = stop_provider(&provider).and_then(|()| files.remove_owner(id));
+            let reply = owner.state.lock().unwrap().archive_reply.take();
+            if let Some(mut reply) = reply {
+                let result = closed.as_ref().ok().map(|()| json!({"archived":true}));
+                let _ = answer(&mut reply, &json!(1), result);
             }
-        }
-        if engine.is_finished() || !matches!(provider.lock().unwrap().try_wait(), Ok(None)) {
-            break;
+            if closed.is_ok() {
+                return Ok(());
+            }
+            // Keep the authenticated endpoint available for retry if cleanup failed.
+            thread::sleep(Duration::from_millis(250));
         }
         match listener.accept() {
             Ok((socket, _)) => {
@@ -511,13 +553,27 @@ fn serve(directory: PathBuf, id: Uuid, workspace: PathBuf, executable: PathBuf) 
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20))
             }
-            Err(_) => break,
+            Err(error) => {
+                stop_provider(&provider)?;
+                files.remove_owner(id)?;
+                return Err(error);
+            }
         }
     }
+}
+
+fn stop_provider(provider: &Mutex<std::process::Child>) -> io::Result<()> {
     let mut provider = provider.lock().unwrap();
-    let _ = provider.kill();
-    let _ = provider.wait();
-    files.remove_owner(id)
+    if provider.try_wait()?.is_none() {
+        // A provider can exit between try_wait and kill.
+        if let Err(error) = provider.kill() {
+            if provider.try_wait()?.is_none() {
+                return Err(error);
+            }
+        }
+        provider.wait()?;
+    }
+    Ok(())
 }
 
 pub(super) fn command() -> Option<io::Result<()>> {
