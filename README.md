@@ -162,32 +162,37 @@ estado confirmado del turno más reciente. Una sesión importada sin turno
 pasa a `idle` cuando se confirma que está libre.
 
 Al restaurar el registro, el Scheduler aprovecha primero los desenlaces
-confirmados que ya constan en la cola persistente. Para un registro que
-sigue por confirmar, `reconcile_session` consulta el adaptador configurado
-con `session/load` y descarta las actualizaciones de historial de la carga.
-Solo admite evidencia del mismo ID nativo y workspace. La respuesta debe
-incluir `_meta["session-scheduler/sessionState"]` con `sessionId`, `cwd`
-(la ruta de workspace de la solicitud) y `status: "idle"`. El adaptador
-debe verificar el estado actual de la sesión en ese workspace, incluyendo
-cualquier actividad del agente que pueda seguir en curso. La recarga
-estándar de ACP por sí sola no confirma que la sesión esté libre. Los
-fixtures de aceptación implementan esta evidencia. La importación de una
-sesión real de OpenCode 1.19.6 confirma el registro de la referencia, pero
-no verifica el estado del agente. Para continuar tras reiniciar, tanto
-Codex como OpenCode requieren un adaptador que proporcione esta evidencia
-positiva. Si falta, el Scheduler rechaza el nuevo envío.
+confirmados que ya constan en la cola persistente.
 
-Para corregir un turno, el Scheduler incluye su ID en
-`params._meta["session-scheduler/promptRequestId"]`. La respuesta debe
-incluir también el `turnOutcome` correlacionado descrito arriba. Un
-adaptador que desconoce el estado actual o el desenlace deja el registro
-por confirmar. Si hay evidencia, `inspect_session` conserva la fuente
-`acp_session_load`, el ID del turno pertinente y la fecha de la observación.
-La reconciliación omite el envío de prompts y la emisión de eventos. Un
-`follow_up` posterior comprueba la evidencia de nuevo y pide el desenlace
-del último turno, incluso si la corrección fue de un turno anterior.
-Si el adaptador contradice el último desenlace confirmado, se rechaza el
-envío. Un turno nuevo tiene su propio evento de finalización.
+Las sesiones nuevas de OpenCode 1.19.6 creadas mediante MCP HTTP tienen un
+proceso propietario que mantiene la conexión ACP original cuando se reinicia
+solo el Scheduler. OpenCode conserva el historial en su propia base de datos
+por sesión bajo el directorio de estado privado. El registro del Scheduler
+conserva únicamente metadatos. El propietario registra la respuesta ACP
+correlacionada con el último turno ordinario. Esa versión de OpenCode responde
+al recibir la señal explícita de que la sesión está libre. La reconciliación
+comprueba que el propietario sigue activo y que coinciden el ID nativo,
+el workspace y el turno. La fuente registrada es `opencode_owner`.
+
+Si el propietario terminó, el turno no produjo esa evidencia o la sesión
+de OpenCode fue importada sin propietario verificado, el Scheduler conserva
+el bloqueo. Detener todo el árbol de procesos también detiene al propietario.
+Los comandos de barra de OpenCode conservan su flujo ACP en vivo. Reconciliar
+después de un reinicio requiere evidencia de un turno ordinario.
+
+Para un adaptador Codex con evidencia propia, la respuesta de `session/load`
+debe incluir `_meta["session-scheduler/sessionState"]` con el mismo
+`sessionId`, `cwd` y `status: "idle"`. El adaptador verifica el estado
+actual en la instancia propietaria. Para reconciliar un turno, la respuesta
+también debe incluir el `turnOutcome` correlacionado con el ID enviado
+en `params._meta["session-scheduler/promptRequestId"]`. La fuente registrada
+es `acp_session_load`.
+
+`inspect_session` incluye la fuente, el turno y la fecha de la observación.
+Reconciliar no envía prompts ni emite eventos. `follow_up` vuelve a verificar
+la evidencia, comprueba la confianza vigente del workspace y rechaza una
+observación que contradiga el último desenlace confirmado. El turno nuevo
+tiene su propio evento de finalización.
 
 ## Registro local en Codex Desktop
 
@@ -242,3 +247,15 @@ pwsh -NoProfile -File tests/windows_private_events_smoke.ps1 `
   -ProxyWorkspace $proxyWorkspace -ReadOnlyPrompt $prompt `
   -ExpectedOutput $expectedOutput
 ```
+
+Para verificar la reconciliación del propietario de OpenCode 1.19.6, ejecuta
+la prueba aislada en Windows con Node.js y los binarios de desarrollo:
+
+```powershell
+node tests/opencode_owner_windows.cjs $schedulerExe $openCodeExe
+```
+
+La prueba conserva el mismo puerto MCP y estado al reiniciar solo el Scheduler.
+Abre dos sesiones de OpenCode con un modelo HTTP de prueba en loopback. Deja
+una ocupada mientras reconcilia la otra y comprueba el mismo ID nativo, los
+envíos bloqueados y una única entrega firmada del turno nuevo.

@@ -223,7 +223,7 @@ class HttpEvents(unittest.TestCase):
             state = Path(root, 'state'); state.mkdir(mode=0o700)
             project = Path(root, 'project'); project.mkdir()
             native = 'ses_external_fixture'
-            imported = {'agent': 'opencode', 'native_session_id': native, 'workspace': str(project)}
+            imported = {'agent': 'codex', 'native_session_id': native, 'workspace': str(project)}
             (project / 'reconciliation-session').write_text(json.dumps({'session': native, 'request': None}))
             (project / 'reconciliation-state').write_text('idle')
             with self.workspace_mcp(state, project) as (_, call):
@@ -235,7 +235,7 @@ class HttpEvents(unittest.TestCase):
                 self.assertFalse(error, correction)
                 self.assertIsNone(correction['turn_id'])
                 record = self.workspace_session(call, dict(ids, turn_id=None), 'idle')
-                self.assertEqual(record['agent'], 'opencode')
+                self.assertEqual(record['agent'], 'codex')
                 self.assertEqual(record['acp_session_id'], native)
                 self.assertIsNone(record['turn_id'])
                 self.assertIsNone(record['stop_reason'])
@@ -250,6 +250,28 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(record['acp_session_id'], native)
                 self.assertEqual((project / 'reconciliation-prompts').read_text().splitlines(),
                                  ['first Scheduler message'])
+
+    def test_unowned_opencode_import_remains_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            native = 'ses_external_fixture'
+            (project / 'reconciliation-session').write_text(json.dumps({'session': native, 'request': None}))
+            (project / 'reconciliation-state').write_text('idle')
+            with self.workspace_mcp(state, project) as (_, call):
+                error, registration = call('import_session', {
+                    'agent': 'opencode', 'native_session_id': native, 'workspace': str(project),
+                })
+                self.assertFalse(error, registration)
+                ids = {'session_id': registration['session_id']}
+            with self.workspace_mcp(state, project) as (_, call):
+                self.assertEqual(call('reconcile_session', ids),
+                                 (True, {'status': 'idle_evidence_unavailable'}))
+                self.assertTrue(call('follow_up', dict(ids, prompt='must stay blocked'))[0])
+                self.assertTrue(call('reconnect_session', ids)[0])
+                record = self.workspace_session(call, dict(ids, turn_id=None), 'pending_confirmation')
+                self.assertEqual(record['acp_session_id'], native)
+                self.assertFalse((project / 'reconciliation-prompts').exists())
 
     def test_reconcile_historical_turn_preserves_newer_confirmed_outcome(self):
         with tempfile.TemporaryDirectory() as root:

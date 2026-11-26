@@ -1,6 +1,7 @@
 mod acp;
 mod events;
 mod http;
+mod opencode_owner;
 mod session_registry;
 mod state_files;
 use acp::{AcpJob, Start};
@@ -611,6 +612,20 @@ impl State {
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or_else(unavailable)?;
+        if matches!(adapter.kind, AgentKind::OpenCode) {
+            if record["opencode_managed"] != true {
+                return Err(unavailable());
+            }
+            let id = record["session_id"].as_str().ok_or_else(unavailable)?;
+            return opencode_owner::observe(
+                &Arc::downgrade(&self.children),
+                id,
+                workspace,
+                native_id,
+                turn_id,
+            )
+            .map_err(|_| unavailable());
+        }
         // Use a separate child slot. An observation must not become the session's worker.
         let (connection, loaded) = adapter
             .load(
@@ -713,7 +728,8 @@ impl State {
                     .is_some_and(|ids| !ids.is_empty())
         );
         record["reconciliation"] = json!({
-            "source":"acp_session_load", "turn_id":target, "latest_turn_id":original["turn_id"],
+            "source":if matches!(adapter.kind, AgentKind::OpenCode) { "opencode_owner" } else { "acp_session_load" },
+            "turn_id":target, "latest_turn_id":original["turn_id"],
             "stop_reason":reason,
             "observed_at":chrono::Utc::now().to_rfc3339(),
         });
@@ -998,8 +1014,10 @@ impl State {
             return unavailable();
         }
         let proof = &original["reconciliation"];
-        let expected = (proof["source"] == "acp_session_load"
-            && proof["latest_turn_id"] == original["turn_id"])
+        let expected = (matches!(
+            proof["source"].as_str(),
+            Some("acp_session_load" | "opencode_owner")
+        ) && proof["latest_turn_id"] == original["turn_id"])
             .then(|| (proof["turn_id"].as_str(), proof["stop_reason"].as_str()));
         let adapter = match self.session_adapter(&original) {
             Ok(adapter) => adapter,
@@ -1033,6 +1051,9 @@ impl State {
             };
         if let Some(turn) = latest {
             let observed = acp::verified_outcome(&loaded, acp_id, turn);
+            if matches!(adapter.kind, AgentKind::OpenCode) && observed.is_none() {
+                return conflict();
+            }
             if let Some((_, reason)) = expected.filter(|(target, _)| *target == latest) {
                 if observed != reason {
                     return conflict();
@@ -1208,6 +1229,11 @@ impl State {
         record["archived"] = json!(true);
         self.workers.lock().unwrap().remove(id);
         self.cancel_writers.lock().unwrap().remove(id);
+        let owned = record["opencode_managed"] == true;
+        drop(records);
+        if owned {
+            let _ = opencode_owner::archive(id);
+        }
         result(json!({"session_id":id,"archived":true}), false)
     }
     fn dispatch(&self, request: Value) -> (Option<Value>, Option<Launch>) {
@@ -1353,6 +1379,17 @@ impl State {
     }
 }
 fn main() {
+    if let Some(result) = opencode_owner::command() {
+        if let Err(error) = result {
+            eprintln!("OpenCode owner: {error}");
+            std::process::exit(if error.kind() == io::ErrorKind::Unsupported {
+                2
+            } else {
+                1
+            });
+        }
+        return;
+    }
     if env::var_os("SESSION_SCHEDULER_HTTP_PORT").is_some() {
         if let Err(error) = http::serve() {
             eprintln!("HTTP server: {error}");

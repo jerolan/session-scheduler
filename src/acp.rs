@@ -14,6 +14,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) fn remove_scheduler_credentials(command: &mut Command) {
+    for (key, _) in env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("SESSION_SCHEDULER_")
+            || name.starts_with("CONTROL_PLANE_")
+            || name == "OPENAI_ADMIN_KEY"
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 const RECOVERY_ATTEMPTS: usize = 3;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -286,11 +298,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    fn send(&self, value: Value) -> io::Result<()> {
+    pub(super) fn send(&self, value: Value) -> io::Result<()> {
         send(&mut *self.input.lock().unwrap(), value)
     }
 
-    fn response(
+    pub(super) fn response(
         &mut self,
         request_id: &Value,
         mut on_update: impl FnMut(&Value),
@@ -344,14 +356,30 @@ impl Connection {
         }
     }
 
-    fn setup(&mut self, id: u64, method: &str, params: Value) -> io::Result<Value> {
+    pub(super) fn setup(&mut self, id: u64, method: &str, params: Value) -> io::Result<Value> {
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
         self.response(&json!(id), |_| {})?
             .ok_or_else(|| io::Error::other("ACP request failed"))
     }
 
-    fn initialize(&mut self) -> io::Result<Value> {
+    pub(super) fn initialize(&mut self) -> io::Result<Value> {
         self.setup(1, "initialize", json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"session-scheduler","version":"0.1.0"}}))
+    }
+
+    pub(super) fn input_handle(&self) -> Arc<Mutex<ChildStdin>> {
+        self.input.clone()
+    }
+
+    pub(super) fn child_handle(&self) -> Arc<Mutex<Child>> {
+        self.child.clone()
+    }
+
+    pub(super) fn set_observation_deadline(&mut self) {
+        self.deadline = Some(Instant::now() + RECOVERY_TIMEOUT);
+    }
+
+    pub(super) fn clear_observation_deadline(&mut self) {
+        self.deadline = None;
     }
 
     pub(super) fn bind(&mut self, id: &str) {
@@ -378,21 +406,27 @@ impl Adapter {
         id: &str,
         workspace: &Path,
     ) -> io::Result<Connection> {
+        let mut command = self.provider_command();
+        command.stderr(Stdio::null());
+        Self::connect_command(command, children, id, workspace)
+    }
+
+    pub(super) fn provider_command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         match self.kind {
             AgentKind::Codex => command.env("INITIAL_AGENT_MODE", "read-only"),
             AgentKind::OpenCode => command.arg("acp"),
         };
-        for (key, _) in env::vars_os() {
-            // Windows environment keys are case-insensitive.
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            if name.starts_with("SESSION_SCHEDULER_")
-                || name.starts_with("CONTROL_PLANE_")
-                || name == "OPENAI_ADMIN_KEY"
-            {
-                command.env_remove(key);
-            }
-        }
+        command
+    }
+
+    pub(super) fn connect_command(
+        mut command: Command,
+        children: &Weak<Mutex<ChildRegistry>>,
+        id: &str,
+        workspace: &Path,
+    ) -> io::Result<Connection> {
+        remove_scheduler_credentials(&mut command);
         let registry = children
             .upgrade()
             .ok_or_else(|| io::Error::other("scheduler stopped"))?;
@@ -409,7 +443,6 @@ impl Adapter {
             .env_remove("APP_SERVER_LOGS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .spawn()?;
         let input = Arc::new(Mutex::new(child.stdin.take().unwrap()));
         let reader = BufReader::new(child.stdout.take().unwrap());
@@ -510,9 +543,27 @@ pub(super) fn verified_outcome<'a>(
 
 impl AcpJob {
     fn open_session(&self) -> io::Result<(Connection, String)> {
-        let mut connection = self
-            .adapter
-            .connect(&self.children, &self.id, &self.workspace)?;
+        let managed = if self.events.is_some() && matches!(self.adapter.kind, AgentKind::OpenCode) {
+            match crate::opencode_owner::start(
+                &self.adapter,
+                &self.children,
+                &self.id,
+                &self.workspace,
+            ) {
+                Ok(connection) => Some(connection),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let owned = managed.is_some();
+        let mut connection = match managed {
+            Some(connection) => connection,
+            None => self
+                .adapter
+                .connect(&self.children, &self.id, &self.workspace)?,
+        };
         connection.initialize()?;
         let session = connection.setup(
             2,
@@ -525,12 +576,34 @@ impl AcpJob {
             .ok_or_else(|| io::Error::other("missing ACP session"))?
             .to_owned();
         update(&self.sessions, &self.id, |s| {
-            s["acp_session_id"] = json!(id)
+            s["acp_session_id"] = json!(id);
+            if owned {
+                s["opencode_managed"] = json!(true);
+            }
         });
         Ok((connection, id))
     }
 
     fn recover(&self, acp_id: &str, turn_id: &str) -> io::Result<(Connection, Option<String>)> {
+        if self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&self.id)
+            .is_some_and(|record| record["opencode_managed"] == true)
+        {
+            let (mut connection, observation) = crate::opencode_owner::observe(
+                &self.children,
+                &self.id,
+                &self.workspace,
+                acp_id,
+                Some(turn_id),
+            )?;
+            let reason = verified_outcome(&observation, acp_id, turn_id)
+                .ok_or_else(|| io::Error::other("OpenCode owner lacks evidence for this turn"))?;
+            connection.bind(&self.id);
+            return Ok((connection, Some(reason.to_owned())));
+        }
         let mut history = Vec::new();
         let mut user_message_id = None;
         let (connection, loaded) = self.adapter.load(
@@ -680,7 +753,8 @@ impl AcpJob {
         let (mut connection, acp_id, mut first) = match start {
             Start::New(turn) => match self.open_session() {
                 Ok((connection, acp_id)) => (connection, acp_id, Some(turn)),
-                Err(_) => {
+                Err(error) => {
+                    eprintln!("ACP session initialization failed: {error}");
                     self.retire();
                     self.finish(&turn.id, None);
                     return;
