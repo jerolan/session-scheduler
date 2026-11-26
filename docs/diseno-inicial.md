@@ -1,6 +1,6 @@
 # Diseño inicial de Session Scheduler
 
-Dot delega trabajo a Codex CLI y OpenCode mediante un plugin MCP. Session Scheduler registra las delegaciones, abre las sesiones por ACP y avisa a Dot cuando termina un turno.
+La integración prevista permite a Dot delegar trabajo a Codex CLI y OpenCode mediante MCP. Session Scheduler registra las delegaciones y abre las sesiones por ACP. El descubrimiento y la entrega de avisos a Dot requieren validación independiente.
 
 ## Workspaces y sesiones
 
@@ -24,4 +24,12 @@ Dot delega trabajo a Codex CLI y OpenCode mediante un plugin MCP. Session Schedu
 
 ## Primera validación de la integración
 
-Conectar un plugin privado a Dot mediante Secure MCP Tunnel y verificar que Dot puede suscribirse, delegar un turno, recibir su evento y consultar la sesión. Repetir el recorrido con Codex CLI y OpenCode.
+Session Scheduler y Codex Desktop se ejecutan de forma nativa en Windows. El scheduler ofrece Streamable HTTP en `127.0.0.1`, exige autenticación bearer y guarda su estado con acceso restringido a su propietario en una unidad local de Windows. La VM Linux aloja el repositorio de desarrollo y los workspaces a los que acceden las sesiones mediante SSH.
+
+En Windows, `SESSION_SCHEDULER_STATE_DIR` debe señalar una ruta absoluta cuyo directorio padre ya exista y cuyos componentes no tengan puntos de reanálisis. El scheduler puede crear el directorio de estado con una DACL protegida para su cuenta de Windows. Si ya existe, comprueba la DACL antes de leer el estado.
+
+La prueba local usa el ejecutable de Windows, un fixture ACP nativo y un receptor en loopback. Ejecutar `pwsh -File tests/windows_private_events_smoke.ps1 -SchedulerExe <exe> -FixtureExe <exe>` para verificar la firma y la correlación de los eventos, la persistencia de la suscripción tras un reinicio y las restricciones de acceso con una configuración desechable.
+
+En la configuración local de Codex, declarar `[mcp_servers.session_scheduler]` con la URL de loopback, `http_headers_helper` para obtener el bearer del almacén de credenciales del usuario y `default_tools_approval_mode = "prompt"`. Comprobar el descubrimiento de herramientas en Desktop con una consulta de solo lectura. [Configuración MCP de Codex](https://learn.chatgpt.com/docs/extend/mcp)
+
+La aceptación con el Dot conectado requiere comprobar que puede descubrir el servidor local, suscribirse y recibir el evento de un turno real. La demostración interactiva requiere una solicitud explícita del usuario. Las guías de Dot y MCP Events describen las computadoras conectadas, los plugins habilitados y la entrega por callback HTTPS. La compatibilidad de la suscripción con el servidor local de Codex queda por verificar. [Computadoras y aplicaciones de Dot](https://learn.chatgpt.com/docs/dots/computers-and-apps) · [MCP Events](https://developers.openai.com/plugins/build/mcp-events)

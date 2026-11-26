@@ -6,11 +6,11 @@ Cuando Dot delega trabajo a un agente de programación, el turno puede terminar 
 
 ## Solución
 
-Session Scheduler será una herramienta escrita en Rust que expone un plugin MCP privado para Dot y controla sesiones de Codex CLI y OpenCode mediante ACP. Dot puede delegar y administrar sesiones por workspace, recibir un MCP Event cuando termine cada turno y consultar o reconectar una sesión si se interrumpe. El usuario puede comprobar la integración desde su propio Dot con un encargo que devuelve `pong`.
+Session Scheduler será una herramienta escrita en Rust que expone un servidor MCP local y controla sesiones de Codex CLI y OpenCode mediante ACP. La integración prevista permitiría a Dot delegar y administrar sesiones por workspace, recibir un MCP Event cuando termine cada turno y consultar o reconectar una sesión si se interrumpe. La disponibilidad de ese recorrido en Dot requiere validación independiente.
 
 ## Historias de usuario
 
-1. Como usuario, quiero conectar el MCP en Codex Desktop para poder usar la integración con mi Dot.
+1. Como usuario, quiero configurar el MCP en Codex Desktop y comprobar el descubrimiento de sus herramientas.
 2. Como usuario, quiero pedirle a Dot que delegue un encargo en lenguaje natural para iniciar trabajo sin abrir manualmente el agente.
 3. Como usuario, quiero poder delegar a Codex CLI para aprovecharlo en los proyectos donde lo uso.
 4. Como usuario, quiero poder delegar a OpenCode para elegir el agente que corresponde al encargo.
@@ -42,11 +42,12 @@ Session Scheduler será una herramienta escrita en Rust que expone un plugin MCP
 - Session Scheduler y su servidor MCP se escribirán en Rust. Codex CLI y OpenCode son los dos agentes iniciales vía ACP.
 - Cada sesión delegada pertenece a un workspace. El scheduler usa el workspace que le proporciona el entorno al abrir o reconectar la sesión. El entorno se encarga de prepararlo. La concurrencia entre sesiones depende del workspace.
 - El flujo inicial admite delegar desde Windows y el uso de carpetas proxy cuyos repositorios canónicos se trabajan por SSH.
+- Para la integración privada, Session Scheduler, su estado persistente y Codex Desktop se ejecutan de forma nativa en Windows. La VM Linux aloja el repositorio de desarrollo y los workspaces a los que se accede por SSH.
 - MCP es la interfaz principal. Expone delegación, listado, inspección, seguimiento, cancelación, archivado y reconexión de sesiones gestionadas. El registro conserva la relación entre workspace, sesión del scheduler, sesión ACP y turnos.
 - El scheduler registra el turno antes de enviarlo y conserva su resultado cuando está disponible. Un encargo de seguimiento mantiene la sesión y recibe otro ID de turno.
 - Las solicitudes de permiso interactivo se deniegan. El archivado de una sesión con trabajo activo requiere cancelar y esperar el desenlace del turno.
-- El plugin privado se conecta a Codex Desktop y se habilita para el Dot del usuario. Secure MCP Tunnel es la vía elegida para la primera validación de la conexión privada.
-- Dot se suscribe a los eventos de la cuenta conectada. El scheduler entrega MCP Events mediante el webhook firmado de la suscripción. Un turno con desenlace confirmado genera un evento de finalización con sus identificadores y su motivo de cierre.
+- El servidor MCP escucha mediante Streamable HTTP en `127.0.0.1` y exige autenticación bearer. Codex Desktop usa el servidor de su configuración local, un helper para obtener el bearer y la aprobación solicitada para las herramientas.
+- La integración de Events prevista entrega MCP Events mediante el webhook firmado de una suscripción válida. Un turno con desenlace confirmado genera un evento de finalización con sus identificadores y su motivo de cierre.
 - El evento pendiente se registra junto con el desenlace antes de intentar entregarlo. Los reintentos tras fallos temporales y reinicios reutilizan el ID del evento.
 - Ante la pérdida de la respuesta, el scheduler intenta recuperar la misma sesión y confirmar el desenlace del turno. Reconectar conserva la conversación. Volver a ejecutar el encargo requiere una solicitud explícita.
 - Si se agotan los intentos automáticos con el desenlace aún indeterminado, el scheduler emite un evento de recuperación requerida. Dot puede consultar el último estado y solicitar una reconexión. Una confirmación posterior produce el evento de finalización.
@@ -55,7 +56,8 @@ Session Scheduler será una herramienta escrita en Rust que expone un plugin MCP
 
 La interfaz MCP y la recepción del webhook son el punto principal de prueba. Los casos observan las respuestas de las herramientas, el estado consultable y los eventos que recibe el consumidor. El repositorio parte de un diseño nuevo y todavía carece de pruebas previas.
 
-- **Aceptación con el Dot del usuario.** Con el MCP conectado en Codex Desktop y la suscripción activa en Dot, el usuario le pide a Dot que delegue una sesión y que el agente responda `pong`. El scheduler abre una sesión ACP real. Se comprueba que el webhook corresponde a los IDs de esa delegación y que Dot reacciona comunicando el `pong` sin una segunda solicitud del usuario.
+- **Descubrimiento en Desktop.** Configurar el servidor local y comprobar mediante una consulta de solo lectura que Codex Desktop descubre sus herramientas.
+- **Aceptación con el Dot del usuario.** Solo ante una solicitud explícita del usuario para la demostración interactiva, comprobar mediante una ruta permitida que el Dot conectado descubre la integración y tiene una suscripción activa. El usuario le pide delegar una sesión real que responda `pong`. Verificar que el evento corresponde a sus IDs y que Dot comunica el resultado sin una segunda solicitud.
 - **Compatibilidad inicial.** Ejercitar la creación de sesión, el turno y la entrega del evento con Codex CLI y OpenCode. Verificar que un segundo turno conserva el ID de sesión y se reconoce por su propio ID. Incluir un workspace de Windows con carpeta proxy a Linux.
 - **Administración.** Verificar vía MCP el listado, la consulta, el permiso interactivo denegado, la cancelación y el archivado. Una sesión con trabajo activo sigue visible hasta que el turno alcanza un desenlace y se archiva. El historial sigue disponible.
 - **Entrega persistente.** Simular un receptor temporalmente inaccesible y reiniciar el scheduler. Comprobar que el aviso llega al recuperarse el receptor, con el mismo ID.
@@ -67,8 +69,9 @@ La interfaz MCP y la recepción del webhook son el punto principal de prueba. Lo
 - Aprovisionar workspaces, administrar sus checkouts o imponer una sola política de concurrencia.
 - Gestionar sesiones que se abrieron fuera de Session Scheduler o borrar definitivamente su historial.
 - Definir la reacción de Dot más allá de verificar que pueda actuar al recibir el evento.
-- Dar soporte inicial a agentes distintos de Codex CLI y OpenCode o publicar el plugin en el directorio público.
+- Dar soporte inicial a agentes distintos de Codex CLI y OpenCode.
+- Añadir infraestructura de acceso al MCP fuera del equipo, configurar cuentas de plataforma o exponer el servidor al público.
 
 ## Notas
 
-El resultado de un turno y la entrega de su evento se observan por separado. Recuperar el historial ACP puede restablecer la sesión aunque el desenlace del turno siga indeterminado. El ensayo con el Dot del usuario comprueba la suscripción, la recepción y la reacción completa.
+El resultado de un turno y la entrega de su evento se observan por separado. Recuperar el historial ACP puede restablecer la sesión aunque el desenlace del turno siga indeterminado. El descubrimiento y la suscripción desde el Dot conectado requieren validación independiente. El [diseño de la integración local](diseno-inicial.md#primera-validación-de-la-integración) describe esa verificación.
