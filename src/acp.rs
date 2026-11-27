@@ -7,17 +7,29 @@ use std::{
     collections::BTreeMap,
     env,
     io::{self, BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{mpsc, Arc, Mutex, Weak},
     thread,
     time::{Duration, Instant},
 };
 
+pub(super) fn remove_scheduler_credentials(command: &mut Command) {
+    for (key, _) in env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("SESSION_SCHEDULER_")
+            || name.starts_with("CONTROL_PLANE_")
+            || name == "OPENAI_ADMIN_KEY"
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 const RECOVERY_ATTEMPTS: usize = 3;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn known_stop_reason(reason: &str) -> bool {
+pub(crate) fn known_stop_reason(reason: &str) -> bool {
     matches!(
         reason,
         "end_turn" | "cancelled" | "refusal" | "max_tokens" | "max_turn_requests" | "failed"
@@ -231,9 +243,52 @@ fn reconcile_history(record: &mut Value, turn_id: &str, replayed: &[Value]) {
     }
 }
 
+fn provider_workspace(workspace: &Path) -> std::borrow::Cow<'_, str> {
+    let path = workspace.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{}", unc).into();
+        }
+        if let Some(local) = path.strip_prefix(r"\\?\") {
+            return local.to_owned().into();
+        }
+    }
+    path
+}
+
+pub(super) fn matches_provider_workspace(cwd: &Value, workspace: &Path) -> bool {
+    let Some(reported) = cwd.as_str() else {
+        return false;
+    };
+    let reported = Path::new(reported);
+    if !reported.is_absolute() {
+        return false;
+    }
+    if reported == workspace {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Limit filesystem access to spellings of the requested workspace.
+        provider_workspace(reported).eq_ignore_ascii_case(&provider_workspace(workspace))
+            && reported.canonicalize().is_ok_and(|path| path == workspace)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 pub(super) enum Start {
     New(Turn),
-    Reconnect { acp_id: String, turn_id: String },
+    Reconnect {
+        acp_id: String,
+        turn_id: String,
+    },
+    Resume {
+        connection: Connection,
+        acp_id: String,
+        turn: Turn,
+    },
 }
 
 pub(super) struct AcpJob {
@@ -248,7 +303,7 @@ pub(super) struct AcpJob {
     pub cancel_writers: CancelWriters,
 }
 
-struct Connection {
+pub(super) struct Connection {
     child: Arc<Mutex<Child>>,
     children: Weak<Mutex<ChildRegistry>>,
     id: String,
@@ -278,11 +333,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    fn send(&self, value: Value) -> io::Result<()> {
+    pub(super) fn send(&self, value: Value) -> io::Result<()> {
         send(&mut *self.input.lock().unwrap(), value)
     }
 
-    fn response(
+    pub(super) fn response(
         &mut self,
         request_id: &Value,
         mut on_update: impl FnMut(&Value),
@@ -336,57 +391,93 @@ impl Connection {
         }
     }
 
-    fn setup(&mut self, id: u64, method: &str, params: Value) -> io::Result<Value> {
+    pub(super) fn setup(&mut self, id: u64, method: &str, params: Value) -> io::Result<Value> {
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
         self.response(&json!(id), |_| {})?
             .ok_or_else(|| io::Error::other("ACP request failed"))
     }
 
-    fn initialize(&mut self) -> io::Result<Value> {
+    pub(super) fn initialize(&mut self) -> io::Result<Value> {
         self.setup(1, "initialize", json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"session-scheduler","version":"0.1.0"}}))
     }
 
-    fn alive(&self) -> bool {
+    pub(super) fn input_handle(&self) -> Arc<Mutex<ChildStdin>> {
+        self.input.clone()
+    }
+
+    pub(super) fn child_handle(&self) -> Arc<Mutex<Child>> {
+        self.child.clone()
+    }
+
+    pub(super) fn set_observation_deadline(&mut self) {
+        self.deadline = Some(Instant::now() + RECOVERY_TIMEOUT);
+    }
+
+    pub(super) fn clear_observation_deadline(&mut self) {
+        self.deadline = None;
+    }
+
+    pub(super) fn bind(&mut self, id: &str) {
+        let registry = self.children.upgrade().unwrap();
+        let mut registry = registry.lock().unwrap();
+        let children = registry.children.remove(&self.id).unwrap();
+        registry
+            .children
+            .entry(id.to_owned())
+            .or_default()
+            .extend(children);
+        self.id = id.to_owned();
+    }
+
+    pub(super) fn alive(&self) -> bool {
         matches!(self.child.lock().unwrap().try_wait(), Ok(None))
     }
 }
 
-impl AcpJob {
-    fn connect(&self) -> io::Result<Connection> {
-        let mut command = Command::new(&self.adapter.executable);
-        match self.adapter.kind {
+impl Adapter {
+    fn connect(
+        &self,
+        children: &Weak<Mutex<ChildRegistry>>,
+        id: &str,
+        workspace: &Path,
+    ) -> io::Result<Connection> {
+        let mut command = self.provider_command();
+        command.stderr(Stdio::null());
+        Self::connect_command(command, children, id, workspace)
+    }
+
+    pub(super) fn provider_command(&self) -> Command {
+        let mut command = Command::new(&self.executable);
+        match self.kind {
             AgentKind::Codex => command.env("INITIAL_AGENT_MODE", "read-only"),
             AgentKind::OpenCode => command.arg("acp"),
         };
-        for (key, _) in env::vars_os() {
-            // Windows environment keys are case-insensitive.
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            if name.starts_with("SESSION_SCHEDULER_")
-                || name.starts_with("CONTROL_PLANE_")
-                || name == "OPENAI_ADMIN_KEY"
-            {
-                command.env_remove(key);
-            }
-        }
-        let registry = self
-            .children
+        command
+    }
+
+    pub(super) fn connect_command(
+        mut command: Command,
+        children: &Weak<Mutex<ChildRegistry>>,
+        id: &str,
+        workspace: &Path,
+    ) -> io::Result<Connection> {
+        remove_scheduler_credentials(&mut command);
+        let registry = children
             .upgrade()
             .ok_or_else(|| io::Error::other("scheduler stopped"))?;
         let mut registry = registry.lock().unwrap();
         if registry.stopping {
             return Err(io::Error::other("scheduler stopped"));
         }
-        let workspace = self.workspace.canonicalize()?;
-        if workspace != self.workspace || !workspace.is_dir() {
+        if workspace.canonicalize()? != workspace || !workspace.is_dir() {
             return Err(io::Error::other("workspace changed"));
         }
         let mut child = command
-            .current_dir(&self.workspace)
+            .current_dir(workspace)
             .env_remove("CODEX_CONFIG")
             .env_remove("APP_SERVER_LOGS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .spawn()?;
         let input = Arc::new(Mutex::new(child.stdin.take().unwrap()));
         let reader = BufReader::new(child.stdout.take().unwrap());
@@ -401,44 +492,100 @@ impl AcpJob {
         let child = Arc::new(Mutex::new(child));
         registry
             .children
-            .entry(self.id.clone())
+            .entry(id.to_owned())
             .or_default()
             .push(child.clone());
         Ok(Connection {
             child,
-            children: self.children.clone(),
-            id: self.id.clone(),
+            children: children.clone(),
+            id: id.to_owned(),
             input,
             output,
             deadline: None,
         })
     }
 
-    fn open_session(&self) -> io::Result<(Connection, String)> {
-        let mut connection = self.connect()?;
-        connection.initialize()?;
-        let session = connection.setup(
-            2,
-            "session/new",
-            json!({"cwd":self.workspace,"mcpServers":[]}),
-        )?;
-        let id = session["sessionId"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| io::Error::other("missing ACP session"))?
-            .to_owned();
-        update(&self.sessions, &self.id, |s| {
-            s["acp_session_id"] = json!(id)
+    pub(super) fn exists_in_workspace(
+        &self,
+        children: &Weak<Mutex<ChildRegistry>>,
+        workspace: &Path,
+        native_id: &str,
+    ) -> io::Result<bool> {
+        let mut connection =
+            self.connect(children, &uuid::Uuid::new_v4().to_string(), workspace)?;
+        let (done, deadline) = mpsc::channel();
+        let child = connection.child.clone();
+        let expires = Instant::now() + RECOVERY_TIMEOUT;
+        connection.deadline = Some(expires);
+        let watchdog = thread::spawn(move || {
+            if deadline
+                .recv_timeout(expires.saturating_duration_since(Instant::now()))
+                .is_err()
+            {
+                let _ = child.lock().unwrap().kill();
+            }
         });
-        Ok((connection, id))
+        let found = (|| {
+            let initialized = connection.initialize()?;
+            if !initialized["agentCapabilities"]["sessionCapabilities"]["list"].is_object() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "ACP session listing is unsupported",
+                ));
+            }
+            let requested_cwd = provider_workspace(workspace);
+            let mut cursor: Option<String> = None;
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let mut params = json!({"cwd":requested_cwd});
+                if let Some(value) = &cursor {
+                    params["cursor"] = json!(value);
+                }
+                connection.send(
+                    json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":params}),
+                )?;
+                let page = connection
+                    .response(&json!(2), |_| {})?
+                    .ok_or_else(|| io::Error::other("ACP session listing failed"))?;
+                let entries = page["sessions"]
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("Invalid ACP session listing"))?;
+                if entries.iter().any(|entry| {
+                    entry["sessionId"] == native_id
+                        && matches_provider_workspace(&entry["cwd"], workspace)
+                }) {
+                    return Ok(true);
+                }
+                match page.get("nextCursor") {
+                    None | Some(Value::Null) => return Ok(false),
+                    Some(Value::String(next)) if !next.is_empty() && seen.insert(next.clone()) => {
+                        cursor = Some(next.clone())
+                    }
+                    _ => return Err(io::Error::other("Invalid ACP session cursor")),
+                }
+            }
+        })();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        if Instant::now() >= expires {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ACP session listing timed out",
+            ));
+        }
+        found
     }
 
-    fn recover(&self, acp_id: &str, turn_id: &str) -> io::Result<(Connection, Option<String>)> {
-        let workspace = self.workspace.canonicalize()?;
-        if workspace != self.workspace || !workspace.is_dir() {
-            return Err(io::Error::other("workspace changed"));
-        }
-        let mut connection = self.connect()?;
+    pub(super) fn load(
+        &self,
+        children: &Weak<Mutex<ChildRegistry>>,
+        id: &str,
+        workspace: &Path,
+        acp_id: &str,
+        observed_turn: Option<&str>,
+        mut on_update: impl FnMut(&Value),
+    ) -> io::Result<(Connection, Value)> {
+        let mut connection = self.connect(children, id, workspace)?;
         let (done, deadline) = mpsc::channel();
         let child = connection.child.clone();
         let expires = Instant::now() + RECOVERY_TIMEOUT;
@@ -452,8 +599,6 @@ impl AcpJob {
                 let _ = child.lock().unwrap().kill();
             }
         });
-        let mut history = Vec::new();
-        let mut user_message_id = None;
         let evidence = (|| {
             let initialized = connection.initialize()?;
             if initialized["agentCapabilities"]["loadSession"] != true {
@@ -462,23 +607,16 @@ impl AcpJob {
                     "ACP session loading is unsupported",
                 ));
             }
-            connection.send(json!({"jsonrpc":"2.0","id":2,"method":"session/load",
-                "params":{"sessionId":acp_id,"cwd":workspace,"mcpServers":[]}}))?;
+            let mut params = json!({"sessionId":acp_id,"cwd":workspace,"mcpServers":[]});
+            if let Some(turn) = observed_turn {
+                params["_meta"]["session-scheduler/promptRequestId"] = json!(turn);
+            }
+            connection
+                .send(json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":params}))?;
             connection
                 .response(&json!(2), |params| {
-                    if params["sessionId"] != acp_id {
-                        return;
-                    }
-                    let update = &params["update"];
-                    if let Some(entry) = visible_update(update, true) {
-                        let mut new_user_message = false;
-                        if entry["role"] == "user" {
-                            let message_id = update["messageId"].as_str();
-                            new_user_message =
-                                message_id.is_some() && message_id != user_message_id.as_deref();
-                            user_message_id = message_id.map(str::to_owned);
-                        }
-                        append_history(&mut history, entry, new_user_message);
+                    if params["sessionId"] == acp_id {
+                        on_update(&params["update"]);
                     }
                 })?
                 .ok_or_else(|| io::Error::other("ACP session load failed"))
@@ -492,13 +630,108 @@ impl AcpJob {
                 "ACP reload timed out",
             ));
         }
-        let loaded = evidence?;
-        let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
-        let reason = outcome["stopReason"].as_str().filter(|reason| {
-            outcome["sessionId"] == acp_id
-                && outcome["promptRequestId"] == turn_id
-                && known_stop_reason(reason)
+        Ok((connection, evidence?))
+    }
+}
+
+pub(super) fn verified_outcome<'a>(
+    loaded: &'a Value,
+    acp_id: &str,
+    turn_id: &str,
+) -> Option<&'a str> {
+    let outcome = &loaded["_meta"]["session-scheduler/turnOutcome"];
+    outcome["stopReason"].as_str().filter(|reason| {
+        outcome["sessionId"] == acp_id
+            && outcome["promptRequestId"] == turn_id
+            && known_stop_reason(reason)
+    })
+}
+
+impl AcpJob {
+    fn open_session(&self) -> io::Result<(Connection, String)> {
+        let managed = if self.events.is_some() && matches!(self.adapter.kind, AgentKind::OpenCode) {
+            match crate::opencode_owner::start(
+                &self.adapter,
+                &self.children,
+                &self.id,
+                &self.workspace,
+            ) {
+                Ok(connection) => Some(connection),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let owned = managed.is_some();
+        let mut connection = match managed {
+            Some(connection) => connection,
+            None => self
+                .adapter
+                .connect(&self.children, &self.id, &self.workspace)?,
+        };
+        connection.initialize()?;
+        let session = connection.setup(
+            2,
+            "session/new",
+            json!({"cwd":self.workspace,"mcpServers":[]}),
+        )?;
+        let id = session["sessionId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| io::Error::other("missing ACP session"))?
+            .to_owned();
+        update(&self.sessions, &self.id, |s| {
+            s["acp_session_id"] = json!(id);
+            if owned {
+                s["opencode_managed"] = json!(true);
+            }
         });
+        Ok((connection, id))
+    }
+
+    fn recover(&self, acp_id: &str, turn_id: &str) -> io::Result<(Connection, Option<String>)> {
+        if self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&self.id)
+            .is_some_and(|record| record["opencode_managed"] == true)
+        {
+            let (mut connection, observation) = crate::opencode_owner::observe(
+                &self.children,
+                &self.id,
+                &self.workspace,
+                acp_id,
+                Some(turn_id),
+            )?;
+            let reason = verified_outcome(&observation, acp_id, turn_id)
+                .ok_or_else(|| io::Error::other("OpenCode owner lacks evidence for this turn"))?;
+            connection.bind(&self.id);
+            return Ok((connection, Some(reason.to_owned())));
+        }
+        let mut history = Vec::new();
+        let mut user_message_id = None;
+        let (connection, loaded) = self.adapter.load(
+            &self.children,
+            &self.id,
+            &self.workspace,
+            acp_id,
+            None,
+            |update| {
+                if let Some(entry) = visible_update(update, true) {
+                    let mut new_user_message = false;
+                    if entry["role"] == "user" {
+                        let message_id = update["messageId"].as_str();
+                        new_user_message =
+                            message_id.is_some() && message_id != user_message_id.as_deref();
+                        user_message_id = message_id.map(str::to_owned);
+                    }
+                    append_history(&mut history, entry, new_user_message);
+                }
+            },
+        )?;
+        let reason = verified_outcome(&loaded, acp_id, turn_id);
         update(&self.sessions, &self.id, |record| {
             if record["turn_id"] == turn_id || reason.is_some() {
                 reconcile_history(record, turn_id, &history);
@@ -626,12 +859,18 @@ impl AcpJob {
         let (mut connection, acp_id, mut first) = match start {
             Start::New(turn) => match self.open_session() {
                 Ok((connection, acp_id)) => (connection, acp_id, Some(turn)),
-                Err(_) => {
+                Err(error) => {
+                    eprintln!("ACP session initialization failed: {error}");
                     self.retire();
                     self.finish(&turn.id, None);
                     return;
                 }
             },
+            Start::Resume {
+                connection,
+                acp_id,
+                turn,
+            } => (connection, acp_id, Some(turn)),
             Start::Reconnect { acp_id, turn_id } => match self.recover(&acp_id, &turn_id) {
                 Ok((connection, reason)) => {
                     self.finish_reconnect(&turn_id, reason.as_deref());

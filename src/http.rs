@@ -30,6 +30,7 @@ pub fn serve() -> io::Result<()> {
         .filter(|s| !s.is_empty() && !s.contains(['\r', '\n']))
         .ok_or_else(|| io::Error::other("missing bearer token"))?;
     let events = Arc::new(Events::from_env()?);
+    let state = Arc::new(State::new(Some(events.clone()))?);
     let server = Server::http(("127.0.0.1", port)).map_err(io::Error::other)?;
     let worker_events = events.clone();
     thread::spawn(move || loop {
@@ -41,7 +42,6 @@ pub fn serve() -> io::Result<()> {
         }
         thread::sleep(std::time::Duration::from_secs(1));
     });
-    let state = Arc::new(State::new(Some(events)));
     for mut request in server.incoming_requests() {
         let state = state.clone();
         let token = token.clone();

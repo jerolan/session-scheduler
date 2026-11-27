@@ -1,11 +1,14 @@
 mod acp;
 mod events;
 mod http;
+mod opencode_owner;
+mod session_registry;
 mod state_files;
 use acp::{AcpJob, Start};
 use events::TurnEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use session_registry::{SessionRegistry, Sessions};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -41,7 +44,6 @@ struct Adapter {
     kind: AgentKind,
     executable: PathBuf,
 }
-type Sessions = Arc<Mutex<BTreeMap<String, Value>>>;
 struct PendingCancel {
     acp_id: String,
     writer: Arc<Mutex<ChildStdin>>,
@@ -125,6 +127,15 @@ enum Work {
     Reconnect { turn_id: String },
 }
 
+fn resolve_workspace(args: &Value) -> Option<PathBuf> {
+    args["workspace"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .and_then(|p| p.canonicalize().ok())
+        .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
+}
+
 fn result(value: Value, error: bool) -> Value {
     json!({"content":[{"type":"text", "text":value.to_string()}], "isError":error})
 }
@@ -154,6 +165,40 @@ fn session_has_status(record: &Value, statuses: &[&str]) -> bool {
                 .as_str()
                 .is_some_and(|status| statuses.contains(&status))
         })
+}
+
+fn reserve_follow_up(record: &mut Value, prompt: &str) -> String {
+    let tid = Uuid::new_v4().to_string();
+    if record["status"] == "unknown" {
+        let unresolved = record["turn_id"].as_str().unwrap().to_owned();
+        let history_turn_index = record["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["role"] == "user")
+            .count()
+            - 1;
+        record["previous_turns"][&unresolved] = json!({
+            "status": "unknown", "stop_reason": null, "result": record["result"],
+            "history_turn_index": history_turn_index,
+        });
+        if record["unresolved_turn_ids"].is_null() {
+            record["unresolved_turn_ids"] = json!([]);
+        }
+        record["unresolved_turn_ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(unresolved));
+    }
+    record["turn_id"] = json!(tid);
+    record["status"] = json!("running");
+    record["result"] = json!("");
+    record["stop_reason"] = Value::Null;
+    record["history"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","text":prompt}));
+    tid
 }
 
 fn finish_turn(
@@ -370,7 +415,7 @@ impl Drop for State {
     }
 }
 impl State {
-    fn new(events: Option<Arc<events::Events>>) -> Self {
+    fn new(events: Option<Arc<events::Events>>) -> io::Result<Self> {
         let configured: Vec<PathBuf> = env::var_os("SESSION_SCHEDULER_WORKSPACES")
             .map(|v| {
                 env::split_paths(&v)
@@ -408,7 +453,36 @@ impl State {
         }
         let executable =
             |name| env::var_os(name).and_then(|p| PathBuf::from(p).canonicalize().ok());
-        Self {
+        let sessions = Arc::new(SessionRegistry::new(events.is_some())?);
+        if let Some(events) = &events {
+            for (id, turn_id, reason) in events.persisted_completions() {
+                let mut records = sessions.lock().unwrap();
+                if let Some(record) = records.get_mut(&id) {
+                    if let Some(ids) = record["unresolved_turn_ids"].as_array_mut() {
+                        ids.retain(|id| id != &turn_id);
+                    }
+                    if record["turn_id"] == turn_id && record["status"] == "pending_confirmation" {
+                        record["status"] = json!(match reason.as_str() {
+                            "end_turn" => "completed",
+                            "cancelled" => "cancelled",
+                            _ => "failed",
+                        });
+                        record["stop_reason"] = if reason == "failed" {
+                            Value::Null
+                        } else {
+                            json!(reason)
+                        };
+                    }
+                    record["restart_blocked"] = json!(
+                        record["status"] == "pending_confirmation"
+                            || record["unresolved_turn_ids"]
+                                .as_array()
+                                .is_some_and(|ids| !ids.is_empty())
+                    );
+                }
+            }
+        }
+        Ok(Self {
             configured,
             workspace_trust: Mutex::new(WorkspaceTrust {
                 decisions,
@@ -417,12 +491,12 @@ impl State {
             trust_store,
             codex_command: executable("SESSION_SCHEDULER_ACP_COMMAND"),
             opencode_command: executable("SESSION_SCHEDULER_OPENCODE_COMMAND"),
-            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions,
             workers: Arc::new(Mutex::new(BTreeMap::new())),
             children: Arc::new(Mutex::new(ChildRegistry::default())),
             cancel_writers: Arc::new(Mutex::new(BTreeMap::new())),
             events,
-        }
+        })
     }
     fn is_workspace_trusted(&self, decisions: &WorkspaceDecisions, workspace: &Path) -> bool {
         (self.events.is_none() || self.trust_store.is_some())
@@ -462,14 +536,277 @@ impl State {
             .map_err(|_| result(json!("Could not save workspace trust"), true))
     }
 
-    fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
-        let Some(workspace) = args["workspace"]
+    fn import_session(&self, args: &Value) -> Value {
+        let Some(agent @ ("codex" | "opencode")) = args["agent"].as_str() else {
+            return result(json!("Unknown agent"), true);
+        };
+        let Some(native_id) = args["native_session_id"]
             .as_str()
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .and_then(|p| p.canonicalize().ok())
-            .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
+            .filter(|id| !id.is_empty() && id.trim() == *id && !id.chars().any(char::is_control))
         else {
+            return result(json!("A native session ID is required"), true);
+        };
+        let Some(workspace) = resolve_workspace(args) else {
+            return result(json!({"status":"invalid_workspace"}), true);
+        };
+        let trust = self.workspace_trust.lock().unwrap();
+        if !self.is_workspace_trusted(&trust.decisions, &workspace) {
+            return result(
+                json!({"status":"workspace_not_trusted", "workspace":workspace}),
+                true,
+            );
+        }
+
+        let workspace_json = json!(workspace);
+        let references_native = |record: &&Value| {
+            record["agent"] == agent
+                && record["acp_session_id"] == native_id
+                && record["workspace"] == workspace_json
+        };
+        let sessions = self.sessions.lock().unwrap();
+        if let Some(record) = sessions.values().find(references_native) {
+            // Older builds could register a pending import without provider evidence.
+            if record["native_id_verified"] == true
+                || !record["turn_id"].is_null()
+                || record["status"] != "pending_confirmation"
+            {
+                return result(
+                    json!({"session_id":record["session_id"], "status":record["status"]}),
+                    false,
+                );
+            }
+        }
+
+        drop(sessions);
+        drop(trust);
+
+        let adapter = match self.session_adapter(&json!({"agent": agent})) {
+            Ok(adapter) => adapter,
+            Err(error) => return error,
+        };
+        match adapter.exists_in_workspace(&Arc::downgrade(&self.children), &workspace, native_id) {
+            Ok(true) => {}
+            Ok(false) => return result(json!({"status":"native_session_not_found"}), true),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                let loaded = adapter.load(
+                    &Arc::downgrade(&self.children),
+                    &Uuid::new_v4().to_string(),
+                    &workspace,
+                    native_id,
+                    None,
+                    |_| {},
+                );
+                let verified = loaded.as_ref().is_ok_and(|(_, evidence)| {
+                    let observation = &evidence["_meta"]["session-scheduler/sessionState"];
+                    observation["sessionId"] == native_id
+                        && acp::matches_provider_workspace(&observation["cwd"], &workspace)
+                });
+                if !verified {
+                    return result(
+                        json!({"status":"native_session_verification_unavailable"}),
+                        true,
+                    );
+                }
+            }
+            Err(_) => {
+                return result(
+                    json!({"status":"native_session_verification_unavailable"}),
+                    true,
+                )
+            }
+        }
+
+        let trust = self.workspace_trust.lock().unwrap();
+        if !self.is_workspace_trusted(&trust.decisions, &workspace) {
+            return result(
+                json!({"status":"workspace_not_trusted", "workspace":workspace}),
+                true,
+            );
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let existing = sessions
+            .values()
+            .find(references_native)
+            .and_then(|record| record["session_id"].as_str())
+            .map(str::to_owned);
+        if let Some(id) = existing {
+            let record = sessions.get_mut(&id).unwrap();
+            record["native_id_verified"] = json!(true);
+            return result(json!({"session_id": id, "status":record["status"]}), false);
+        }
+
+        // Existence supplies no evidence of an observed turn or current activity.
+        let id = Uuid::new_v4().to_string();
+        sessions.insert(
+            id.clone(),
+            json!({
+                "session_id":id, "turn_id":null, "workspace":workspace, "agent":agent,
+                "status":"pending_confirmation", "restart_blocked":true,
+                "acp_session_id":native_id, "native_id_verified":true, "stop_reason":null, "archived":false,
+                "history":[], "result":""
+            }),
+        );
+        drop(sessions);
+        result(
+            json!({"session_id":id, "status":"pending_confirmation"}),
+            false,
+        )
+    }
+
+    fn session_adapter(&self, record: &Value) -> Result<Adapter, Value> {
+        let (kind, command) = match record["agent"].as_str() {
+            Some("codex") => (AgentKind::Codex, &self.codex_command),
+            Some("opencode") => (AgentKind::OpenCode, &self.opencode_command),
+            _ => return Err(result(json!("Unknown agent"), true)),
+        };
+        command
+            .clone()
+            .map(|executable| Adapter { kind, executable })
+            .ok_or_else(|| result(json!("Session adapter is unavailable"), true))
+    }
+
+    fn observe_idle(
+        &self,
+        record: &Value,
+        workspace: &Path,
+        adapter: &Adapter,
+        turn_id: Option<&str>,
+    ) -> Result<(acp::Connection, Value), Value> {
+        let unavailable = || result(json!({"status":"idle_evidence_unavailable"}), true);
+        let native_id = record["acp_session_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(unavailable)?;
+        if matches!(adapter.kind, AgentKind::OpenCode) {
+            if record["opencode_managed"] != true {
+                return Err(unavailable());
+            }
+            let id = record["session_id"].as_str().ok_or_else(unavailable)?;
+            return opencode_owner::observe(
+                &Arc::downgrade(&self.children),
+                id,
+                workspace,
+                native_id,
+                turn_id,
+            )
+            .map_err(|_| unavailable());
+        }
+        // Use a separate child slot. An observation must not become the session's worker.
+        let (connection, loaded) = adapter
+            .load(
+                &Arc::downgrade(&self.children),
+                &Uuid::new_v4().to_string(),
+                workspace,
+                native_id,
+                turn_id,
+                |_| {},
+            )
+            .map_err(|_| unavailable())?;
+        let observation = &loaded["_meta"]["session-scheduler/sessionState"];
+        if observation["status"] != "idle"
+            || observation["sessionId"] != native_id
+            || observation["cwd"] != record["workspace"]
+        {
+            return Err(unavailable());
+        }
+        Ok((connection, loaded))
+    }
+
+    fn reconcile_session(&self, args: &Value) -> Value {
+        let Some(id) = args["session_id"].as_str() else {
+            return result(json!("Session required"), true);
+        };
+        let unavailable = || result(json!("Session does not require reconciliation"), true);
+        let (original, target, workspace, adapter) = {
+            let trust = self.workspace_trust.lock().unwrap();
+            let sessions = self.sessions.lock().unwrap();
+            let Some(record) = sessions.get(id) else {
+                return unavailable();
+            };
+            let target = match args.get("turn_id") {
+                None => &record["turn_id"],
+                Some(turn) if turn.is_string() => turn,
+                _ => return unavailable(),
+            };
+            let pending = if *target == record["turn_id"] {
+                record["status"] == "pending_confirmation"
+            } else {
+                record["unresolved_turn_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.contains(target))
+            };
+            if !pending || record["archived"] == true || record["restart_blocked"] != true {
+                return unavailable();
+            }
+            let workspace = match self.session_workspace(&trust.decisions, record) {
+                Ok(workspace) => workspace,
+                Err(error) => return error,
+            };
+            let adapter = match self.session_adapter(record) {
+                Ok(adapter) => adapter,
+                Err(error) => return error,
+            };
+            (record.clone(), target.clone(), workspace, adapter)
+        };
+        let loaded = match self.observe_idle(&original, &workspace, &adapter, target.as_str()) {
+            Ok((_, loaded)) => loaded,
+            Err(error) => return error,
+        };
+        let (status, reason) = match target.as_str() {
+            None => ("idle", None),
+            Some(turn_id) => {
+                let Some(reason) = acp::verified_outcome(
+                    &loaded,
+                    original["acp_session_id"].as_str().unwrap(),
+                    turn_id,
+                ) else {
+                    return result(json!({"status":"turn_evidence_unavailable"}), true);
+                };
+                let status = match reason {
+                    "end_turn" => "completed",
+                    "cancelled" => "cancelled",
+                    _ => "failed",
+                };
+                (status, Some(reason))
+            }
+        };
+
+        let trust = self.workspace_trust.lock().unwrap();
+        if let Err(error) = self.session_workspace(&trust.decisions, &original) {
+            return error;
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(record) = sessions.get_mut(id).filter(|record| **record == original) else {
+            return unavailable();
+        };
+        if let Some(ids) = record["unresolved_turn_ids"].as_array_mut() {
+            ids.retain(|turn| turn != &target);
+        }
+        if target == original["turn_id"] {
+            record["status"] = json!(status);
+            record["stop_reason"] = json!(reason);
+        }
+        record["restart_blocked"] = json!(
+            record["status"] == "pending_confirmation"
+                || record["unresolved_turn_ids"]
+                    .as_array()
+                    .is_some_and(|ids| !ids.is_empty())
+        );
+        record["reconciliation"] = json!({
+            "source":if matches!(adapter.kind, AgentKind::OpenCode) { "opencode_owner" } else { "acp_session_load" },
+            "turn_id":target, "latest_turn_id":original["turn_id"],
+            "stop_reason":reason,
+            "observed_at":chrono::Utc::now().to_rfc3339(),
+        });
+        result(
+            json!({"session_id":id, "turn_id":target, "status":status,
+                      "reconciliation":record["reconciliation"]}),
+            false,
+        )
+    }
+
+    fn delegate(&self, args: &Value) -> (Value, Option<Launch>) {
+        let Some(workspace) = resolve_workspace(args) else {
             return (result(json!({"status":"invalid_workspace"}), true), None);
         };
         let (kind, executable) = match args.get("agent") {
@@ -650,10 +987,12 @@ impl State {
         let Some(turn_id) = turn_id.map(str::to_owned) else {
             return (result(json!("Invalid turn ID"), true), None);
         };
-        if session_has_status(
-            record,
-            &["running", "cancelling", "completion_pending", "recovering"],
-        ) || record["archived"] == true
+        if record["restart_blocked"] == true
+            || session_has_status(
+                record,
+                &["running", "cancelling", "completion_pending", "recovering"],
+            )
+            || record["archived"] == true
             || !turn_state_mut(record, &turn_id).is_some_and(|turn| turn["status"] == "unknown")
         {
             return (
@@ -722,6 +1061,122 @@ impl State {
             Some(job),
         )
     }
+    fn resume_reconciled(
+        &self,
+        id: &str,
+        prompt: &str,
+        original: Value,
+        workspace: PathBuf,
+    ) -> (Value, Option<Launch>) {
+        let unavailable = || (result(json!("Session is not available"), true), None);
+        // Restore a known-idle outcome only after checking the native session again.
+        if original["restart_blocked"] != false
+            || !matches!(
+                original["status"].as_str(),
+                Some("idle" | "completed" | "cancelled" | "failed")
+            )
+        {
+            return unavailable();
+        }
+        let proof = &original["reconciliation"];
+        let expected = (matches!(
+            proof["source"].as_str(),
+            Some("acp_session_load" | "opencode_owner")
+        ) && proof["latest_turn_id"] == original["turn_id"])
+            .then(|| (proof["turn_id"].as_str(), proof["stop_reason"].as_str()));
+        let adapter = match self.session_adapter(&original) {
+            Ok(adapter) => adapter,
+            Err(error) => return (error, None),
+        };
+        let conflict = || {
+            (
+                result(json!({"status":"turn_evidence_conflicts"}), true),
+                None,
+            )
+        };
+        let acp_id = match original["acp_session_id"].as_str() {
+            Some(id) => id,
+            None => return unavailable(),
+        };
+        let latest = original["turn_id"].as_str();
+        if let Some((Some(turn), reason)) = expected {
+            if Some(turn) != latest {
+                // A correction of an earlier turn cannot corroborate the latest outcome.
+                match self.observe_idle(&original, &workspace, &adapter, Some(turn)) {
+                    Ok((_, loaded)) if acp::verified_outcome(&loaded, acp_id, turn) == reason => {}
+                    Ok(_) => return conflict(),
+                    Err(error) => return (error, None),
+                }
+            }
+        }
+        let (mut connection, loaded) =
+            match self.observe_idle(&original, &workspace, &adapter, latest) {
+                Ok(observation) => observation,
+                Err(error) => return (error, None),
+            };
+        if let Some(turn) = latest {
+            let observed = acp::verified_outcome(&loaded, acp_id, turn);
+            if matches!(adapter.kind, AgentKind::OpenCode) && observed.is_none() {
+                return conflict();
+            }
+            if let Some((_, reason)) = expected.filter(|(target, _)| *target == latest) {
+                if observed != reason {
+                    return conflict();
+                }
+            } else if observed.is_some_and(|reason| original["stop_reason"] != reason) {
+                return conflict();
+            }
+        }
+
+        let trust = self.workspace_trust.lock().unwrap();
+        if let Err(error) = self.session_workspace(&trust.decisions, &original) {
+            return (error, None);
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(record) = sessions.get_mut(id).filter(|record| **record == original) else {
+            return unavailable();
+        };
+        let mut workers = self.workers.lock().unwrap();
+        if workers.contains_key(id) || !connection.alive() {
+            return unavailable();
+        }
+        let tid = reserve_follow_up(record, prompt);
+        connection.bind(id);
+        let (sender, receiver) = mpsc::channel();
+        workers.insert(id.to_owned(), sender);
+        self.cancel_writers
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), Arc::new(Mutex::new(None)));
+        let job = Launch {
+            action: Some(Action::Start {
+                start: Start::Resume {
+                    connection,
+                    acp_id: acp_id.to_owned(),
+                    turn: Turn {
+                        id: tid.clone(),
+                        prompt: prompt.to_owned(),
+                    },
+                },
+                workspace,
+                receiver,
+                workers: self.workers.clone(),
+                children: self.children.clone(),
+                adapter,
+            }),
+            sessions: self.sessions.clone(),
+            id: id.to_owned(),
+            turn_id: tid.clone(),
+            previous: Some(original),
+            events: self.events.clone(),
+            cancel_writers: self.cancel_writers.clone(),
+        };
+        (
+            result(json!({"session_id":id,"turn_id":tid}), false),
+            Some(job),
+        )
+    }
+
     fn follow_up(&self, args: &Value) -> (Value, Option<Launch>) {
         let (Some(id), Some(prompt)) = (
             args["session_id"].as_str(),
@@ -734,18 +1189,26 @@ impl State {
         let Some(record) = sessions.get_mut(id) else {
             return (result(json!("Session not found"), true), None);
         };
-        if session_has_status(
-            record,
-            &["running", "cancelling", "completion_pending", "recovering"],
-        ) || record["archived"] == true
+        if record["archiving"] == true
+            || record["restart_blocked"] == true
+            || session_has_status(
+                record,
+                &["running", "cancelling", "completion_pending", "recovering"],
+            )
+            || record["archived"] == true
         {
             return (result(json!("Session is not available"), true), None);
         }
-        if let Err(error) = self.session_workspace(&trust.decisions, record) {
-            return (error, None);
-        }
-        let Some(sender) = self.workers.lock().unwrap().get(id).cloned() else {
-            return (result(json!("Session is not available"), true), None);
+        let workspace = match self.session_workspace(&trust.decisions, record) {
+            Ok(workspace) => workspace,
+            Err(error) => return (error, None),
+        };
+        let sender = self.workers.lock().unwrap().get(id).cloned();
+        let Some(sender) = sender else {
+            let original = record.clone();
+            drop(sessions);
+            drop(trust);
+            return self.resume_reconciled(id, prompt, original, workspace);
         };
         let usable = self
             .children
@@ -760,36 +1223,7 @@ impl State {
             return (result(json!("Session is not available"), true), None);
         }
         let previous = record.clone();
-        let tid = Uuid::new_v4().to_string();
-        if record["status"] == "unknown" {
-            let unresolved = record["turn_id"].as_str().unwrap().to_owned();
-            let history_turn_index = record["history"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|entry| entry["role"] == "user")
-                .count()
-                - 1;
-            record["previous_turns"][&unresolved] = json!({
-                "status": "unknown", "stop_reason": null, "result": record["result"],
-                "history_turn_index": history_turn_index,
-            });
-            if record["unresolved_turn_ids"].is_null() {
-                record["unresolved_turn_ids"] = json!([]);
-            }
-            record["unresolved_turn_ids"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(unresolved));
-        }
-        record["turn_id"] = json!(tid);
-        record["status"] = json!("running");
-        record["result"] = json!("");
-        record["stop_reason"] = Value::Null;
-        record["history"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"user","text":prompt}));
+        let tid = reserve_follow_up(record, prompt);
         let job = Launch {
             action: Some(Action::Send(
                 sender,
@@ -852,12 +1286,34 @@ impl State {
             record["status"].as_str(),
             Some("completed" | "failed" | "cancelled")
         ) || record["archived"] == true
+            || record["archiving"] == true
             || record["unresolved_turn_ids"]
                 .as_array()
                 .is_some_and(|ids| !ids.is_empty())
         {
             return result(json!("Session cannot be archived"), true);
         }
+        if record["opencode_managed"] != true {
+            return self.finish_archive(id, record);
+        }
+
+        // Reserve this session while waiting for the owner without stalling other sessions.
+        record["archiving"] = json!(true);
+        drop(records);
+        let closed = opencode_owner::archive(id).is_ok();
+        let mut records = self.sessions.lock().unwrap();
+        let record = records.get_mut(id).unwrap();
+        record.as_object_mut().unwrap().remove("archiving");
+        if !closed {
+            return result(
+                json!("OpenCode owner shutdown could not be confirmed. Retry archive."),
+                true,
+            );
+        }
+        self.finish_archive(id, record)
+    }
+
+    fn finish_archive(&self, id: &str, record: &mut Value) -> Value {
         record["archived"] = json!(true);
         self.workers.lock().unwrap().remove(id);
         self.cancel_writers.lock().unwrap().remove(id);
@@ -910,6 +1366,30 @@ impl State {
                         "required":["workspace","prompt"]
                     }
                 },{"name":"approve_workspace","description":"After the user explicitly approves the exact workspace in this chat, approve and continue the retained attempt. Retry with the same attempt_id if needed.","inputSchema":{"type":"object","properties":{"attempt_id":{"type":"string"}},"required":["attempt_id"]}},{"name":"revoke_workspace","description":"When the user asks to revoke trust, revoke it for the effective workspace. Existing history remains readable and active turns continue.","inputSchema":{"type":"object","properties":{"workspace":{"type":"string","description":"Absolute path to the workspace"}},"required":["workspace"]}},{"name":"follow_up","description":"Continue an existing session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"prompt":{"type":"string"}},"required":["session_id","prompt"]}},{"name":"list_sessions","description":"List sessions","inputSchema":{"type":"object","properties":{}}},{"name":"inspect_session","description":"Inspect a session","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}, {"name":"cancel_turn","description":"Request cancellation of a specific turn","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id","turn_id"]}}, {"name":"reconnect_session","description":"Recover an indeterminate turn in the existing session (defaults to the latest turn)","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},"required":["session_id"]}}, {"name":"archive_session","description":"Archive a session with a confirmed outcome","inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}]});
+                if self.events.is_some() {
+                    catalog["tools"].as_array_mut().unwrap().push(json!({
+                        "name":"reconcile_session",
+                        "description":"Check the configured adapter for verifiable evidence that a pending session is idle. Defaults to the latest turn, or the session if imported without a turn. Supply an earlier unresolved turn ID to correct it without replacing a newer outcome.",
+                        "inputSchema":{
+                            "type":"object",
+                            "properties":{"session_id":{"type":"string"},"turn_id":{"type":"string"}},
+                            "required":["session_id"]
+                        }
+                    }));
+                    catalog["tools"].as_array_mut().unwrap().push(json!({
+                        "name":"import_session",
+                        "description":"Register an existing native session in a trusted workspace. Activity remains pending confirmation until independently verified.",
+                        "inputSchema":{
+                            "type":"object",
+                            "properties":{
+                                "agent":{"type":"string","enum":["codex","opencode"]},
+                                "native_session_id":{"type":"string"},
+                                "workspace":{"type":"string","description":"Absolute path to the workspace"}
+                            },
+                            "required":["agent","native_session_id","workspace"]
+                        }
+                    }));
+                }
                 if self.events.is_none() {
                     catalog["tools"][0]["description"] =
                         json!("Delegate work to Codex or OpenCode in a configured workspace");
@@ -944,6 +1424,8 @@ impl State {
                     },
                     "approve_workspace" if self.events.is_some() => self.approve_workspace(args),
                     "revoke_workspace" if self.events.is_some() => self.revoke_workspace(args),
+                    "reconcile_session" if self.events.is_some() => self.reconcile_session(args),
+                    "import_session" if self.events.is_some() => self.import_session(args),
                     "cancel_turn" => self.cancel_turn(args),
                     "archive_session" => self.archive_session(args),
                     "reconnect_session" => {
@@ -980,6 +1462,17 @@ impl State {
     }
 }
 fn main() {
+    if let Some(result) = opencode_owner::command() {
+        if let Err(error) = result {
+            eprintln!("OpenCode owner: {error}");
+            std::process::exit(if error.kind() == io::ErrorKind::Unsupported {
+                2
+            } else {
+                1
+            });
+        }
+        return;
+    }
     if env::var_os("SESSION_SCHEDULER_HTTP_PORT").is_some() {
         if let Err(error) = http::serve() {
             eprintln!("HTTP server: {error}");
@@ -987,7 +1480,7 @@ fn main() {
         }
         return;
     }
-    let state = State::new(None);
+    let state = State::new(None).expect("in-memory scheduler state");
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Ok(request) = serde_json::from_str::<Value>(&line) else {

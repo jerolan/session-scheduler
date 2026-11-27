@@ -18,11 +18,48 @@ remembered_reply = None
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
-    if method == 'initialize': result = {'protocolVersion':1,'agentCapabilities':{'loadSession':True},'authMethods':[]}
+    if method == 'initialize': result = {'protocolVersion':1,'agentCapabilities':{'loadSession':True,'sessionCapabilities':{'list':{}}},'authMethods':[]}
+    elif method == 'session/list':
+        saved_path = Path('reconciliation-session')
+        entries = []
+        if saved_path.exists():
+            saved = json.loads(saved_path.read_text())
+            entries.append({'sessionId': saved['session'], 'cwd': str(Path.cwd())})
+        result = {'sessions': entries}
     elif method == 'session/new':
         memory = None
         result = {'sessionId':session_id}
     elif method == 'session/load':
+        if Path('reconciliation-state').exists():
+            saved = json.loads((Path('reconciliation-session') if Path(
+                'reconciliation-session').exists() else interrupted).read_text())
+            assert msg['params']['sessionId'] == saved['session']
+            session_id = saved['session']
+            scenario = Path('reconciliation-state').read_text()
+            result = {}
+            if scenario != 'missing':
+                result['_meta'] = {
+                    'session-scheduler/sessionState': {
+                        'sessionId': 'foreign' if scenario == 'wrong-native' else session_id,
+                        'cwd': '/other' if scenario == 'wrong-workspace' else msg['params']['cwd'],
+                        'status': 'busy' if scenario == 'busy' else 'idle',
+                    },
+                    'session-scheduler/turnOutcome': {
+                        'sessionId': session_id,
+                        'promptRequestId': 'obsolete' if scenario == 'wrong-turn' else saved['request'],
+                        'stopReason': 'cancelled' if scenario == 'conflicting-outcome' else 'end_turn',
+                    },
+                }
+            latest_turn = Path('contradictory-latest-turn')
+            if latest_turn.exists():
+                contradictory = latest_turn.read_text()
+                if msg['params'].get('_meta', {}).get(
+                        'session-scheduler/promptRequestId') == contradictory:
+                    result['_meta']['session-scheduler/turnOutcome'].update(
+                        promptRequestId=contradictory, stopReason='end_turn')
+            update('private history sent during load')
+            print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':result}), flush=True)
+            continue
         if not interrupted.exists():
             sys.exit(1)
         previous = json.loads(interrupted.read_text())
@@ -120,7 +157,13 @@ for line in sys.stdin:
             continue
         if prompt == 'complete_and_exit':
             Path('fixture.pid').write_text(str(os.getpid()))
+        if prompt == 'hold_turn' or Path('reconciliation-session').exists():
+            with Path('reconciliation-prompts').open('a') as log:
+                print(prompt, file=log)
         if prompt == 'hold_turn':
+            Path('reconciliation-session').write_text(json.dumps({
+                'session': session_id, 'request': msg['id'],
+            }))
             Path('prompt-ready').touch()
             deadline = time.monotonic() + 10
             while not Path('release-turn').exists():

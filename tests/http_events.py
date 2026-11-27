@@ -1,4 +1,5 @@
-import base64, hashlib, hmac, http.client, json, os, queue, socket, subprocess, tempfile, threading, time, unittest
+import base64, hashlib, hmac, http.client, json, os, queue, socket, sqlite3, subprocess, tempfile, threading, time, unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +42,324 @@ class RecoveringReceiver(Receiver):
 
 
 class HttpEvents(unittest.TestCase):
+    def test_import_native_session_is_scoped_durable_and_nonexecuting(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            other = Path(root, 'other'); other.mkdir()
+            alias = Path(root, 'alias'); alias.symlink_to(project, target_is_directory=True)
+            native = 'ses_outside'
+            (project / 'reconciliation-session').write_text(json.dumps({'session': native, 'request': None}))
+            (project / 'reconciliation-state').write_text('busy')
+            args = {'agent': 'opencode', 'native_session_id': native, 'workspace': str(project)}
+            configured = os.pathsep.join(map(str, (project, other)))
+            with self.workspace_mcp(state, configured) as (rpc, call):
+                self.assertIn('import_session', [t['name'] for t in rpc('tools/list', {})['tools']])
+                rpc('tools/call', {'name': 'import_session', 'arguments': args}, authenticated=False)
+                self.assertEqual(call('list_sessions', {}), (False, []))
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    imports = list(pool.map(lambda _: call('import_session', args), range(4)))
+                error, imported = imports[0]
+                self.assertFalse(error, imported)
+                self.assertEqual(imports, [(False, imported)] * 4)
+                session_id = {'session_id': imported['session_id']}
+                self.assertEqual(imported['status'], 'pending_confirmation')
+                self.assertEqual(call('import_session', dict(args, workspace=str(alias))), (False, imported))
+                self.assertEqual(call('import_session', dict(args, native_session_id='ses_missing')),
+                                 (True, {'status': 'native_session_not_found'}))
+                self.assertEqual(call('import_session', dict(args, workspace=str(other))),
+                                 (True, {'status': 'native_session_not_found'}))
+                self.assertTrue(call('import_session', dict(args, native_session_id=' '))[0])
+                self.assertTrue(call('import_session', dict(args, agent='unknown'))[0])
+                self.assertEqual(len(call('list_sessions', {})[1]), 1)
+                for tool, extra in (('follow_up', {'prompt': 'blocked prompt'}), ('reconnect_session', {})):
+                    self.assertTrue(call(tool, dict(session_id, **extra))[0])
+
+            # Simulate pending references from before provider verification was required.
+            with sqlite3.connect(state / 'registry' / 'sessions.sqlite') as registry:
+                metadata, = registry.execute('SELECT metadata FROM sessions WHERE id = ?',
+                                             (imported['session_id'],)).fetchone()
+                legacy = json.loads(metadata)
+                del legacy['native_id_verified']
+                registry.execute('UPDATE sessions SET metadata = ? WHERE id = ?',
+                                 (json.dumps(legacy), imported['session_id']))
+                rejected = dict(legacy, session_id='legacy-missing', acp_session_id='ses_missing')
+                registry.execute('INSERT INTO sessions VALUES (?, ?)',
+                                 (rejected['session_id'], json.dumps(rejected)))
+
+            with self.workspace_mcp(state, configured) as (_, call):
+                self.assertEqual(call('import_session', args), (False, imported))
+                self.assertEqual(call('import_session', dict(args, native_session_id='ses_missing')),
+                                 (True, {'status': 'native_session_not_found'}))
+                self.assertEqual(call('inspect_session', {'session_id': 'legacy-missing'})[1]['status'],
+                                 'pending_confirmation')
+                self.assertIn(dict(session_id, workspace=str(project), turn_id=None,
+                                   status='pending_confirmation'), call('list_sessions', {})[1])
+                error, record = call('inspect_session', session_id)
+                self.assertFalse(error)
+                self.assertEqual(record['agent'], 'opencode')
+                self.assertEqual(record['acp_session_id'], native)
+                self.assertEqual(record['status'], 'pending_confirmation')
+                self.assertIsNone(record['turn_id'])
+                self.assertIsNone(record['stop_reason'])
+                self.assertEqual(record['history'], [])
+                self.assertFalse((project / 'reconciliation-prompts').exists())
+                call('revoke_workspace', {'workspace': str(project)})
+                self.assertEqual(call('import_session', args),
+                                 (True, {'status': 'workspace_not_trusted', 'workspace': str(project)}))
+
+    def test_import_requires_matching_workspace_and_handles_listing_pages(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            calls = Path(root, 'calls')
+            adapter = Path(root, 'adapter')
+            adapter.write_text("""#!/usr/bin/python3
+import json, sys
+from pathlib import Path
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    with Path(%r).open('a') as log:
+        print(method, file=log)
+    if method == 'initialize':
+        result = {'protocolVersion': 1, 'agentCapabilities': {'sessionCapabilities': {'list': {}}}}
+    elif method == 'session/list':
+        if request['params'].get('cursor') == 'second':
+            result = {'sessions': [{'sessionId': 'ses_external', 'cwd': str(Path.cwd())}]}
+        else:
+            result = {'sessions': [{'sessionId': 'ses_external', 'cwd': '/wrong'}], 'nextCursor': 'second'}
+    else:
+        raise RuntimeError('unexpected request')
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+""" % str(calls))
+            adapter.chmod(0o700)
+            with self.workspace_mcp(state, project, adapter) as (_, call):
+                error, imported = call('import_session', {
+                    'agent': 'opencode', 'native_session_id': 'ses_external', 'workspace': str(project),
+                })
+                self.assertFalse(error, imported)
+                self.assertEqual(imported['status'], 'pending_confirmation')
+                self.assertEqual(calls.read_text().splitlines(), ['initialize', 'session/list', 'session/list'])
+
+    def test_import_preserves_observed_outcome_without_emitting_turn_events(self):
+        with self.recovery_mcp() as (state, call, expect_event, receiver):
+            error, ids = call('delegate', {'workspace': state, 'prompt': 'hello'})
+            self.assertFalse(error)
+            expect_event('turn.completed', ids, 'end_turn')
+            observed = self.workspace_session(call, ids, 'completed')
+            args = {'agent': 'codex', 'workspace': state,
+                    'native_session_id': observed['acp_session_id']}
+            self.assertEqual(call('import_session', args),
+                             (False, {'session_id': ids['session_id'], 'status': 'completed'}))
+            self.assertEqual(call('inspect_session', ids), (False, observed))
+            Path(state, 'reconciliation-session').write_text(json.dumps({'session': 'external-session', 'request': None}))
+            error, imported = call('import_session', dict(args, native_session_id='external-session'))
+            self.assertFalse(error, imported)
+            self.assertEqual(imported['status'], 'pending_confirmation')
+            with self.assertRaises(queue.Empty):
+                receiver.messages.get(timeout=.5)
+
+    def test_session_registry_survives_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            with self.workspace_mcp(state, project) as (_, call):
+                error, ids = call('delegate', {'workspace':str(project), 'prompt':'private-prompt-sentinel'})
+                self.assertFalse(error)
+                finished = self.workspace_session(call, ids, 'completed')
+                self.assertIsNotNone(finished['acp_session_id'])
+            with self.workspace_mcp(state, project) as (_, call):
+                error, restored = call('inspect_session', ids)
+                self.assertFalse(error)
+                self.assertEqual(restored['session_id'], ids['session_id'])
+                self.assertEqual(restored['turn_id'], ids['turn_id'])
+                self.assertEqual(restored['status'], 'completed')
+                self.assertEqual(restored['acp_session_id'], finished['acp_session_id'])
+                self.assertEqual(len(call('list_sessions', {})[1]), 1)
+            persisted = b''.join(path.read_bytes() for path in state.rglob('sessions.sqlite*') if path.is_file())
+            self.assertNotIn(b'private-prompt-sentinel', persisted)
+            self.assertNotIn(b'fixture result', persisted)
+
+    def test_interrupted_turn_is_blocked_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            with self.workspace_mcp(state, project) as (_, call):
+                error, ids = call('delegate', {'workspace':str(project), 'prompt':'hold_turn'})
+                self.assertFalse(error)
+                deadline = time.monotonic() + 5
+                while not (project / 'prompt-ready').exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                before = call('inspect_session', ids)[1]
+                self.assertIsNotNone(before['acp_session_id'])
+            with self.workspace_mcp(state, project) as (_, call):
+                error, after = call('inspect_session', ids)
+                self.assertFalse(error)
+                self.assertEqual(after['status'], 'pending_confirmation')
+                self.assertEqual(after['acp_session_id'], before['acp_session_id'])
+                self.assertTrue(call('follow_up', {'session_id':ids['session_id'], 'prompt':'unexpected'})[0])
+                self.assertTrue(call('reconnect_session', ids)[0])
+                self.assertEqual(call('inspect_session', ids)[1]['status'], 'pending_confirmation')
+
+    def test_reconcile_restored_turn_only_with_scoped_idle_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            with self.workspace_mcp(state, project) as (_, call):
+                error, ids = call('delegate', {'workspace': str(project), 'prompt': 'hold_turn'})
+                self.assertFalse(error)
+                deadline = time.monotonic() + 5
+                while not (project / 'prompt-ready').exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                native = call('inspect_session', ids)[1]['acp_session_id']
+
+            with self.workspace_mcp(state, project) as (rpc, call):
+                self.assertIn('reconcile_session', [t['name'] for t in rpc('tools/list', {})['tools']])
+                rpc('tools/call', {'name': 'reconcile_session', 'arguments': ids}, authenticated=False)
+                pending = self.workspace_session(call, ids, 'pending_confirmation')
+                follow = dict(session_id=ids['session_id'], prompt='fresh request')
+                self.assertTrue(call('follow_up', follow)[0])
+                self.assertTrue(call('reconnect_session', ids)[0])
+                self.assertTrue(call('reconcile_session', dict(ids, turn_id='obsolete'))[0])
+                evidence = project / 'reconciliation-state'
+                for invalid in ('missing', 'busy', 'wrong-native', 'wrong-workspace', 'wrong-turn'):
+                    with self.subTest(evidence=invalid):
+                        evidence.write_text(invalid)
+                        self.assertTrue(call('reconcile_session', ids)[0])
+                        self.assertEqual(call('inspect_session', ids), (False, pending))
+                        self.assertTrue(call('follow_up', follow)[0])
+                evidence.write_text('idle')
+                error, correction = call('reconcile_session', ids)
+                self.assertFalse(error, correction)
+                reconciled = self.workspace_session(call, ids, 'completed')
+                self.assertEqual(reconciled['reconciliation']['source'], 'acp_session_load')
+                self.assertEqual(reconciled['reconciliation']['turn_id'], ids['turn_id'])
+                self.assertEqual(reconciled['acp_session_id'], native)
+                self.assertEqual(reconciled['history'], [])
+                self.assertTrue(call('reconcile_session', ids)[0])
+                self.assertEqual(call('inspect_session', ids), (False, reconciled))
+
+            with self.workspace_mcp(state, project) as (_, call):
+                restored = self.workspace_session(call, ids, 'completed')
+                self.assertEqual(restored['reconciliation'], reconciled['reconciliation'])
+                for changed in ('busy', 'conflicting-outcome'):
+                    evidence.write_text(changed)
+                    self.assertTrue(call('follow_up', follow)[0])
+                    self.assertEqual(call('inspect_session', ids), (False, restored))
+                evidence.write_text('idle')
+                error, next_ids = call('follow_up', follow)
+                self.assertFalse(error, next_ids)
+                self.assertEqual(next_ids['session_id'], ids['session_id'])
+                self.assertNotEqual(next_ids['turn_id'], ids['turn_id'])
+                continued = self.workspace_session(call, next_ids, 'completed')
+                self.assertEqual(continued['acp_session_id'], native)
+                self.assertEqual(len(call('list_sessions', {})[1]), 1)
+                self.assertTrue(call('reconcile_session', ids)[0])
+                self.assertEqual((project / 'reconciliation-prompts').read_text().splitlines(),
+                                 ['hold_turn', 'fresh request'])
+
+    def test_reconcile_imported_session_confirms_idle_without_inventing_turn(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            native = 'ses_external_fixture'
+            imported = {'agent': 'codex', 'native_session_id': native, 'workspace': str(project)}
+            (project / 'reconciliation-session').write_text(json.dumps({'session': native, 'request': None}))
+            (project / 'reconciliation-state').write_text('idle')
+            with self.workspace_mcp(state, project) as (_, call):
+                error, registration = call('import_session', imported)
+                self.assertFalse(error, registration)
+                ids = {'session_id': registration['session_id']}
+            with self.workspace_mcp(state, project) as (_, call):
+                error, correction = call('reconcile_session', ids)
+                self.assertFalse(error, correction)
+                self.assertIsNone(correction['turn_id'])
+                record = self.workspace_session(call, dict(ids, turn_id=None), 'idle')
+                self.assertEqual(record['agent'], 'codex')
+                self.assertEqual(record['acp_session_id'], native)
+                self.assertIsNone(record['turn_id'])
+                self.assertIsNone(record['stop_reason'])
+                self.assertFalse((project / 'reconciliation-prompts').exists())
+                self.assertTrue(call('archive_session', ids)[0])
+                self.assertEqual(call('import_session', imported), (False, dict(ids, status='idle')))
+            with self.workspace_mcp(state, project) as (_, call):
+                error, new = call('follow_up', dict(ids, prompt='first Scheduler message'))
+                self.assertFalse(error, new)
+                self.assertEqual(new['session_id'], ids['session_id'])
+                record = self.workspace_session(call, new, 'completed')
+                self.assertEqual(record['acp_session_id'], native)
+                self.assertEqual((project / 'reconciliation-prompts').read_text().splitlines(),
+                                 ['first Scheduler message'])
+
+    def test_unowned_opencode_import_remains_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            native = 'ses_external_fixture'
+            (project / 'reconciliation-session').write_text(json.dumps({'session': native, 'request': None}))
+            (project / 'reconciliation-state').write_text('idle')
+            with self.workspace_mcp(state, project) as (_, call):
+                error, registration = call('import_session', {
+                    'agent': 'opencode', 'native_session_id': native, 'workspace': str(project),
+                })
+                self.assertFalse(error, registration)
+                ids = {'session_id': registration['session_id']}
+            with self.workspace_mcp(state, project) as (_, call):
+                self.assertEqual(call('reconcile_session', ids),
+                                 (True, {'status': 'idle_evidence_unavailable'}))
+                self.assertTrue(call('follow_up', dict(ids, prompt='must stay blocked'))[0])
+                self.assertTrue(call('reconnect_session', ids)[0])
+                record = self.workspace_session(call, dict(ids, turn_id=None), 'pending_confirmation')
+                self.assertEqual(record['acp_session_id'], native)
+                self.assertFalse((project / 'reconciliation-prompts').exists())
+
+    def test_reconcile_historical_turn_preserves_newer_confirmed_outcome(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root, 'state'); state.mkdir(mode=0o700)
+            project = Path(root, 'project'); project.mkdir()
+            with self.workspace_mcp(state, project) as (_, call):
+                error, original = call('delegate', {'workspace': str(project), 'prompt': 'recover_late'})
+                self.assertFalse(error, original)
+                self.workspace_session(call, original, 'unknown')
+                follow = {'session_id': original['session_id'], 'prompt': 'cancelled'}
+                error, latest = call('follow_up', follow)
+                self.assertFalse(error, latest)
+                before = self.workspace_session(call, latest, 'cancelled')
+
+            with self.workspace_mcp(state, project) as (_, call):
+                self.assertTrue(call('follow_up', follow)[0])
+                (project / 'reconciliation-state').write_text('idle')
+                error, correction = call('reconcile_session', original)
+                self.assertFalse(error, correction)
+                self.assertEqual(correction['turn_id'], original['turn_id'])
+                self.assertEqual(correction['status'], 'completed')
+                after = self.workspace_session(call, latest, 'cancelled')
+                self.assertEqual(after['turn_id'], latest['turn_id'])
+                self.assertEqual(after['stop_reason'], 'cancelled')
+                self.assertEqual(after['unresolved_turn_ids'], [])
+                self.assertEqual(after['acp_session_id'], before['acp_session_id'])
+                self.assertTrue(call('reconcile_session', original)[0])
+                contradiction = project / 'contradictory-latest-turn'
+                contradiction.write_text(latest['turn_id'])
+                self.assertEqual(call('follow_up', dict(follow, prompt='must not run')),
+                                 (True, {'status': 'turn_evidence_conflicts'}))
+                self.assertEqual(call('inspect_session', latest), (False, after))
+                contradiction.unlink()
+                error, new = call('follow_up', dict(follow, prompt='newest'))
+                self.assertFalse(error, new)
+                self.workspace_session(call, new, 'completed')
+
+            with self.workspace_mcp(state, project) as (_, call):
+                error, newest = call('follow_up', dict(follow, prompt='after another restart'))
+                self.assertFalse(error, newest)
+                continued = self.workspace_session(call, newest, 'completed')
+                self.assertEqual(continued['acp_session_id'], before['acp_session_id'])
+                self.assertEqual(call('revoke_workspace', {'workspace': str(project)})[1]['status'], 'revoked')
+                self.assertEqual(call('follow_up', follow)[1]['status'], 'workspace_not_trusted')
+
     def test_workspace_approval_is_exact_idempotent_and_persistent(self):
         with tempfile.TemporaryDirectory() as root:
             state = Path(root, 'state'); state.mkdir(mode=0o700)
@@ -78,7 +397,7 @@ class HttpEvents(unittest.TestCase):
                 self.assertEqual(call('delegate', {'workspace':str(configured), 'prompt':'hello'})[1]['status'], 'approval_required')
 
     @contextmanager
-    def workspace_mcp(self, state, configured):
+    def workspace_mcp(self, state, configured, adapter=FIXTURE):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
@@ -87,7 +406,8 @@ class HttpEvents(unittest.TestCase):
                    SESSION_SCHEDULER_ACCOUNT='test-account',
                    SESSION_SCHEDULER_STATE_DIR=str(state),
                    SESSION_SCHEDULER_WORKSPACES=str(configured),
-                   SESSION_SCHEDULER_ACP_COMMAND=FIXTURE)
+                   SESSION_SCHEDULER_ACP_COMMAND=str(adapter),
+                   SESSION_SCHEDULER_OPENCODE_COMMAND=str(adapter))
 
         def rpc(method, params, authenticated=True):
             headers = {'Content-Type': 'application/json'}
@@ -232,7 +552,7 @@ class HttpEvents(unittest.TestCase):
                 error, pending = call('delegate', dict(args, prompt='hello'))
                 self.assertFalse(error)
                 self.assertEqual(pending['status'], 'approval_required')
-                self.assertEqual(call('list_sessions', {}), (False, []))
+                self.assertIn(ids['session_id'], [item['session_id'] for item in call('list_sessions', {})[1]])
                 self.assertIn('session_id', call('delegate', {'workspace': str(legacy), 'prompt': 'hello'})[1])
                 error, _ = call('approve_workspace', {'attempt_id': pending['attempt_id']})
                 self.assertFalse(error)
@@ -410,12 +730,27 @@ class HttpEvents(unittest.TestCase):
                     persisted = json.loads(pending_path.read_text())
                 finally:
                     scheduler.kill()
+            # Model a crash after the event was durably queued but before the
+            # corresponding registry commit, using the real pending event.
+            crash_window = failure_status == 408 and final_status == 'completed'
+            if crash_window:
+                database = next(Path(state).rglob('sessions.sqlite'))
+                with sqlite3.connect(database) as db:
+                    metadata = json.loads(db.execute('SELECT metadata FROM sessions WHERE id = ?', (ids['session_id'],)).fetchone()[0])
+                    metadata['status'] = 'completion_pending'
+                    metadata['stop_reason'] = None
+                    metadata['archived'] = False
+                    db.execute('UPDATE sessions SET metadata = ? WHERE id = ?', (json.dumps(metadata), ids['session_id']))
             receiver.recovered.set()
             with start() as scheduler:
                 try:
                     wait_for_scheduler()
-                    self.assertEqual(call('list_sessions', {}), (False, []))
-                    self.assertEqual(call('inspect_session', session), (True, 'Session not found'))
+                    error, restored = call('inspect_session', session)
+                    self.assertFalse(error)
+                    self.assertEqual(restored['turn_id'], ids['turn_id'])
+                    self.assertEqual(restored['status'], 'pending_confirmation' if final_status == 'unknown' else final_status)
+                    listed = [item['session_id'] for item in call('list_sessions', {})[1]]
+                    self.assertEqual(ids['session_id'] in listed, final_status == 'unknown' or crash_window)
                     if not retry:
                         self.assertEqual(persisted, [])
                         with self.assertRaises(queue.Empty):

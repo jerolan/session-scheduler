@@ -29,9 +29,9 @@ function Rpc([string]$method, $params) {
     $body = @{jsonrpc='2.0'; id=1; method=$method; params=$params} | ConvertTo-Json -Depth 20 -Compress
     Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/mcp" -Headers @{Authorization='Bearer test-token'; Accept='application/json, text/event-stream'} -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 10
 }
-function Check-PrivateAcl([string]$path) {
+function Check-PrivateAcl([string]$path, [switch]$AllowOwnerInheritance) {
     $acl = Get-Acl -LiteralPath $path
-    Assert $acl.AreAccessRulesProtected "ACL inherits permissions: $path"
+    Assert ($AllowOwnerInheritance -or $acl.AreAccessRulesProtected) "ACL inherits permissions: $path"
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -eq 'Allow') { Assert ($rule.IdentityReference.Value -eq $owner) "Non-owner allow ACE on $path" }
@@ -160,7 +160,7 @@ try {
     }
     function Inspect([string]$sessionId) {
         $response = Rpc 'tools/call' @{name='inspect_session';arguments=@{session_id=$sessionId}}
-        Assert ($null -eq $response.error -and -not $response.result.isError) 'Session inspection failed'
+        Assert ($null -eq $response.error -and -not $response.result.isError) "Session inspection failed for $sessionId"
         return $response.result.content[0].text | ConvertFrom-Json
     }
     if ($useOpenCode) {
@@ -235,6 +235,24 @@ try {
     $afterFollowUp = Inspect $unknown.session_id
     Assert ($followUp.ids.turn_id -ne $unknown.turn_id -and $afterFollowUp.acp_session_id -eq $beforeFollowUp.acp_session_id -and $afterFollowUp.result -ceq 'pong') 'Explicit follow-up did not reuse loaded context with a new turn'
     Assert ($unknown.turn_id -in $afterFollowUp.unresolved_turn_ids) 'The original indeterminate turn ID was lost'
+    $archive = Rpc 'tools/call' @{name='archive_session';arguments=@{session_id=$interrupted.session_id}}
+    Assert (-not $archive.result.isError) 'Could not archive the completed recovery session'
+    $archivedBefore = Inspect $interrupted.session_id
+    $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt='registry restart probe'}}
+    Assert (-not $delegation.result.isError) 'Registry probe delegation was rejected'
+    $activeIds = $delegation.result.content[0].text | ConvertFrom-Json
+    $readyFile = Join-Path $workspace 'registry-probe-ready'
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        if (Test-Path -LiteralPath $readyFile) {
+            $probeNativeId = Get-Content -LiteralPath $readyFile -Raw
+            if ($probeNativeId) { break }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Assert $probeNativeId 'ACP fixture did not receive the running probe'
+    $activeBefore = Inspect $activeIds.session_id
+    Assert ($activeBefore.status -eq 'running' -and $activeBefore.acp_session_id -ceq $probeNativeId) 'Probe was not active with a native session ID'
     $tools = Rpc 'tools/list' @{}
     Assert ('revoke_workspace' -in $tools.result.tools.name) 'Revocation missing from MCP discovery'
     $revocation = Rpc 'tools/call' @{name='revoke_workspace';arguments=@{workspace=$workspace}}
@@ -249,13 +267,49 @@ try {
     Assert (($afterRevoke.history.text -join '|') -ceq ($after.history.text -join '|')) 'Revocation changed readable history'
 
     $null = Rpc 'events/unsubscribe' @{name='turn.recovery_required';arguments=@{};delivery=@{mode='webhook';url=$callback}}
+    $requestsLog = Join-Path $workspace 'acp-requests.log'
+    $requestsBefore = Get-Content -LiteralPath $requestsLog -Raw
+    # Wait until accepted callbacks are removed from durable delivery before killing the server.
+    $pendingPath = Join-Path $state 'pending-events.json'
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        try { $pendingEvents = Get-Content -LiteralPath $pendingPath -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate } catch { $pendingEvents = @(1) }
+        if ($pendingEvents.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Assert ($pendingEvents.Count -eq 0) 'Accepted callbacks were not committed before restart'
     Stop-Scheduler
     Start-Scheduler
+    $initial = Rpc 'initialize' @{protocolVersion='2025-11-25';capabilities=@{};clientInfo=@{name='windows-restart-smoke';version='1'}}
+    Assert ($null -eq $initial.error) 'MCP initialization after restart failed'
+    $listed = Rpc 'tools/call' @{name='list_sessions';arguments=@{}}
+    Assert (-not $listed.result.isError) 'Session listing after restart failed'
+    $listedBeforeApproval = @($listed.result.content[0].text | ConvertFrom-Json)
+    function Assert-Restored($beforeRestart, [string]$status, [bool]$archived) {
+        $record = Inspect $beforeRestart.session_id
+        foreach ($field in 'session_id','turn_id','acp_session_id','agent','workspace') {
+            Assert ($record.$field -and $record.$field -ceq $beforeRestart.$field) "Restart changed $field for $($beforeRestart.session_id)"
+        }
+        Assert ($record.status -ceq $status -and [bool]$record.archived -eq $archived) "Restart returned unexpected state for $($record.session_id): $($record.status)"
+        Assert (($record.stop_reason -ceq $beforeRestart.stop_reason) -and -not $record.result -and @($record.history | Where-Object { $_ }).Count -eq 0) 'Restart changed the outcome or restored conversation contents'
+        $entry = @($listedBeforeApproval | Where-Object session_id -ceq $record.session_id)
+        if ($archived) {
+            Assert ($entry.Count -eq 0) 'Archived session appeared in the active list'
+        } else {
+            Assert ($entry.Count -eq 1 -and $entry[0].turn_id -ceq $record.turn_id -and $entry[0].status -ceq $status) 'Active list did not reflect the restored IDs and state'
+        }
+    }
+    Assert-Restored $after 'completed' $false
+    Assert-Restored $archivedBefore 'completed' $true
+    Assert-Restored $activeBefore 'pending_confirmation' $false
+    Start-Sleep -Milliseconds 1200
+    Assert ((Get-Content -LiteralPath $requestsLog -Raw) -ceq $requestsBefore) 'Restart sent a request to an ACP session'
+    Assert (@(Receive-Job $receiver).Count -eq 0) 'Restart delivered an extra event'
     $delegation = Rpc 'tools/call' @{name='delegate';arguments=@{workspace=$workspace;prompt='error'}}
     $pending = $delegation.result.content[0].text | ConvertFrom-Json
     Assert (-not $delegation.result.isError -and $pending.status -eq 'approval_required' -and $pending.workspace -ceq $revoked.workspace) 'Revoked startup workspace regained trust after restart'
     $sessions = Rpc 'tools/call' @{name='list_sessions';arguments=@{}}
-    Assert ($sessions.result.content[0].text -ceq '[]') 'Unapproved delegation created a session'
+    Assert ($sessions.result.content[0].text -ceq $listed.result.content[0].text) 'Unapproved delegation changed the active list'
     $approval = @{name='approve_workspace';arguments=@{attempt_id=$pending.attempt_id}}
     $approved = Rpc 'tools/call' $approval
     $retry = Rpc 'tools/call' $approval
@@ -265,12 +319,57 @@ try {
     $message = Next-Message; $event = $message.body | ConvertFrom-Json
     Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.data.session_id -eq $approvedIds.session_id -and $event.data.turn_id -eq $approvedIds.turn_id -and $event.data.reason -eq 'failed') 'Reapproved turn completion was not delivered to the original subscription'
     $sessions = Rpc 'tools/call' @{name='list_sessions';arguments=@{}}
-    Assert (@(($sessions.result.content[0].text | ConvertFrom-Json)).Count -eq 1) 'Reapproval created duplicate sessions'
+    Assert (@($sessions.result.content[0].text | ConvertFrom-Json).Count -eq ($listedBeforeApproval.Count + 1)) 'Reapproval created duplicate sessions'
+    $requestsBefore = Get-Content -LiteralPath $requestsLog -Raw
+    $follow = Rpc 'tools/call' @{name='follow_up';arguments=@{session_id=$activeIds.session_id;prompt='must stay blocked'}}
+    $reconnect = Rpc 'tools/call' @{name='reconnect_session';arguments=@{session_id=$activeIds.session_id;turn_id=$activeIds.turn_id}}
+    Assert ($follow.result.isError -and $reconnect.result.isError) 'Restored unconfirmed turn accepted execution in a trusted workspace'
+    Assert-Restored $activeBefore 'pending_confirmation' $false
+    Assert ((Get-Content -LiteralPath $requestsLog -Raw) -ceq $requestsBefore) 'An unconfirmed turn reached ACP after restart'
+    Assert (@(Receive-Job $receiver).Count -eq 0) 'Restored execution attempt delivered an event'
+    $reconcileArgs = @{name='reconcile_session';arguments=@{session_id=$activeIds.session_id;turn_id=$activeIds.turn_id}}
+    $busy = Rpc 'tools/call' $reconcileArgs
+    Assert ($busy.result.isError -and (Inspect $activeIds.session_id).status -ceq 'pending_confirmation') 'Busy observation overrode pending confirmation'
+    $archiveCorrection = Rpc 'tools/call' @{name='reconcile_session';arguments=@{session_id=$archivedBefore.session_id;turn_id=$archivedBefore.turn_id}}
+    Assert ($archiveCorrection.result.isError -and (Inspect $archivedBefore.session_id).archived) 'Reconciliation changed archived identity'
+    [IO.File]::WriteAllText((Join-Path $workspace 'reconciliation-ready'), 'idle')
+    $correction = Rpc 'tools/call' $reconcileArgs
+    $corrected = Inspect $activeIds.session_id
+    Assert (-not $correction.result.isError -and $corrected.status -ceq 'completed' -and $corrected.acp_session_id -ceq $activeBefore.acp_session_id) 'Reconciliation failed to confirm original native session'
+    Assert ($corrected.reconciliation.source -ceq 'acp_session_load' -and $corrected.reconciliation.turn_id -ceq $activeIds.turn_id -and @($corrected.history).Count -eq 0) 'Reconciliation lost provenance or loaded agent history'
+    Start-Sleep -Milliseconds 1200
+    Assert (@(Receive-Job $receiver).Count -eq 0) 'Reconciliation emitted a completion event'
+    $next = Rpc 'tools/call' @{name='follow_up';arguments=@{session_id=$activeIds.session_id;prompt='fresh registry follow-up'}}
+    $nextIds = $next.result.content[0].text | ConvertFrom-Json
+    Assert (-not $next.result.isError -and $nextIds.session_id -ceq $activeIds.session_id -and $nextIds.turn_id -and $nextIds.turn_id -cne $activeIds.turn_id) 'Reconciled session rejected the explicit new turn'
+    $message = Next-Message; $event = $message.body | ConvertFrom-Json
+    Assert ($message.subscription -eq $id -and $event.name -eq 'turn.completed' -and $event.data.session_id -eq $nextIds.session_id -and $event.data.turn_id -eq $nextIds.turn_id -and $event.data.reason -eq 'end_turn') 'Fresh turn did not emit its own signed completion'
+    $continued = Inspect $activeIds.session_id
+    Assert ($continued.acp_session_id -ceq $activeBefore.acp_session_id -and $continued.turn_id -ceq $nextIds.turn_id) 'Continuation changed the native ID'
+    $stale = Rpc 'tools/call' $reconcileArgs
+    Assert ($stale.result.isError -and (Inspect $activeIds.session_id).turn_id -ceq $nextIds.turn_id) 'Stale evidence replaced the newer turn'
+    $requestsAfter = Get-Content -LiteralPath $requestsLog -Raw
+    Assert ($requestsAfter.StartsWith($requestsBefore) -and (($requestsAfter.Substring($requestsBefore.Length) -split '\r?\n' | Where-Object { $_ }) -join '|') -ceq 'load|load|load|prompt') 'Reconciliation or continuation replayed a prompt or created a native session'
+    $listedAfter = (Rpc 'tools/call' @{name='list_sessions';arguments=@{}}).result.content[0].text | ConvertFrom-Json
+    Assert (@($listedAfter).Count -eq ($listedBeforeApproval.Count + 1) -and @($listedAfter | Where-Object session_id -ceq $activeIds.session_id).Count -eq 1) 'Continuation duplicated a Scheduler session'
     $null = Check-Turn 'error' 'failed'
     $unsubscribed = Rpc 'events/unsubscribe' @{name='turn.completed';arguments=@{};delivery=@{mode='webhook';url=$callback}}
     Assert ($null -eq $unsubscribed.error) 'Unsubscribe did not atomically replace subscriptions'
     Check-PrivateAcl (Join-Path $state 'event-subscriptions.json')
     Stop-Scheduler
+    $registry = Join-Path $state 'registry'
+    $database = Join-Path $registry 'sessions.sqlite'
+    Check-PrivateAcl $registry
+    Check-PrivateAcl $database
+    $sidecarProbe = Join-Path $registry 'inheritance-probe'
+    [IO.File]::WriteAllText($sidecarProbe, '')
+    Check-PrivateAcl $sidecarProbe -AllowOwnerInheritance
+    Remove-Item -LiteralPath $sidecarProbe
+    $databaseText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($database))
+    Assert ($databaseText.StartsWith('SQLite format 3')) 'Session registry is not SQLite'
+    foreach ($content in 'Remember blue plum','Remembered.','registry restart probe','must stay blocked','fresh registry follow-up',$subscription.delivery.secret,'test-token') {
+        Assert (-not $databaseText.Contains($content)) 'Session registry stored conversation content or credentials'
+    }
     $bad = Join-Path $workspace 'broad'
     New-Item -ItemType Directory -Path $bad | Out-Null
     Assert (-not (Get-Acl -LiteralPath $bad).AreAccessRulesProtected) 'Expected a directory with inherited ACLs'
@@ -298,6 +397,10 @@ try {
     Write-Host 'PASS: recovered history and result matched the original turn; explicit follow-up reused an unconfirmed session'
     Write-Host 'PASS: persisted subscription, atomic replacement, protected ACLs and denied ACP approval'
     Write-Host 'PASS: exact-workspace revocation, readable history, blocked follow-up and reconnect, persisted revocation and idempotent reapproval'
+    Write-Host 'PASS: restart preserved exact scheduler, turn and native IDs, terminal outcome and archived visibility'
+    Write-Host 'PASS: restart held the active turn for confirmation, blocked execution and sent no replay or extra event'
+    Write-Host 'PASS: reconciliation preserved the native ID without replay or duplicates, and only the new turn emitted a signed completion'
+    Write-Host 'PASS: SQLite registry excluded conversation contents and credentials and protected the database and sidecar directory'
     Write-Host 'PASS: inherited ACL, junction and junction ancestor were rejected'
 } finally {
     Stop-Scheduler

@@ -60,12 +60,30 @@ del entorno que lo ejecuta. El scheduler cancela las solicitudes ACP de
 permiso interactivo de ambos agentes. Codex sigue usando
 `SESSION_SCHEDULER_ACP_COMMAND`.
 
+## Importar una sesión nativa por MCP
+
+En el MCP HTTP autenticado, llama a `import_session` con `agent` (`codex` u
+`opencode`), `native_session_id` (el ID de una sesión existente) y `workspace`
+(la ruta absoluta de un workspace de confianza). El Scheduler devuelve el
+mismo `session_id` para el mismo agente, ID nativo y workspace efectivo, incluso
+después de reiniciar.
+
+Consulta el registro con `list_sessions` e `inspect_session`. Si el Scheduler ya
+conoce la sesión, conserva su estado. Antes de guardar una referencia nueva,
+el Scheduler pide al proveedor evidencia de que el ID existe en el workspace.
+Si el proveedor no puede verificar ambos, la importación devuelve un error.
+Una referencia verificada queda en `pending_confirmation` hasta comprobar el
+estado de la sesión. Mientras tanto, se bloquean los envíos y la reconexión.
+La importación no abre otra sesión ni envía un mensaje.
+
 ## Encargo de seguimiento por MCP
 
 Para un encargo adicional explícito del usuario, llama a `follow_up` con el
-`session_id` devuelto por `delegate` y el nuevo `prompt`. La sesión debe
-seguir conectada y haber terminado el turno anterior. `follow_up` devuelve
-el mismo `session_id` y un nuevo `turn_id`.
+`session_id` y el nuevo `prompt`. La sesión debe estar libre y el workspace
+debe seguir siendo de confianza. Si el proceso se reinició, el Scheduler
+vuelve a comprobar que la sesión nativa está libre antes de enviar el
+encargo en esa misma sesión. `follow_up` devuelve el mismo `session_id` y
+un nuevo `turn_id`.
 
 `inspect_session` conserva el ID de sesión ACP y el historial de la
 conversación. El estado y el resultado corresponden al turno más reciente.
@@ -80,15 +98,16 @@ confirmado por el agente, incluido `end_turn` si el turno termina normalmente.
 
 Cuando el turno alcance un desenlace confirmado, llama a `archive_session`
 con el `session_id`. La sesión sale de `list_sessions` y sigue disponible
-en `inspect_session` con `archived: true`, su historial y su desenlace.
+en `inspect_session` con `archived: true`, su historial y su desenlace. Para
+una sesión de OpenCode gestionada por el Scheduler, el archivado espera el
+cierre del proceso de OpenCode. Si el cierre no se confirma, la sesión sigue
+visible y se puede volver a intentar el archivado.
 
-El registro de sesiones vive en la memoria del proceso. Los IDs devueltos
-permiten listar e inspeccionar las sesiones durante esa ejecución, pero el
-registro se pierde al reiniciar el scheduler. La cola de eventos pendientes se
-conserva por separado y continúa sus reintentos tras el reinicio, con los
-IDs originales. La persistencia del registro de sesiones corresponde a
-[#12](https://github.com/jerolan/session-scheduler/issues/12), posterior al
-alcance actual.
+El MCP HTTP conserva los metadatos del registro de sesiones en SQLite.
+Tras reiniciar, la inspección conserva los identificadores y el último estado
+conocido. El historial y los resultados observados durante la ejecución viven
+en memoria. La cola de eventos pendientes se conserva por separado y continúa
+sus reintentos con los IDs originales.
 
 ## Recuperación de un turno interrumpido
 
@@ -124,12 +143,61 @@ registrado el evento. Los campos del último turno conservan su valor.
 Resuelve los turnos indeterminados antes de archivar la sesión. La
 reconexión inicializa el adaptador y carga la sesión existente.
 
+Tras reiniciar el servicio HTTP, el registro SQLite conserva los IDs,
+el último estado conocido y el archivado. Usa `list_sessions` para
+localizar sesiones activas e `inspect_session` para consultar sus
+metadatos, incluso si están archivadas. Un turno sin desenlace confirmado
+queda en `pending_confirmation` y bloquea `follow_up` y
+`reconnect_session` para esa sesión. El historial y los resultados
+permanecen en el agente.
+
 ACP estándar puede recargar la conversación. Para confirmar el desenlace,
 el scheduler requiere que la respuesta de `session/load` incluya
 `_meta["session-scheduler/turnOutcome"]` con `sessionId`, `promptRequestId`
 (el ID JSON-RPC original de `session/prompt`) y un `stopReason` terminal
 reconocido. El fixture implementa esta evidencia. Un adaptador que solo
 devuelve la recarga estándar deja el desenlace indeterminado.
+
+## Reconciliar una sesión por confirmar
+
+En el MCP HTTP autenticado, llama a `reconcile_session` con el
+`session_id`. Para corregir un turno anterior que figure en
+`unresolved_turn_ids`, incluye su `turn_id`. El Scheduler conserva el
+estado confirmado del turno más reciente. Una sesión importada sin turno
+pasa a `idle` cuando se confirma que está libre.
+
+Al restaurar el registro, el Scheduler aprovecha primero los desenlaces
+confirmados que ya constan en la cola persistente.
+
+Las sesiones nuevas de OpenCode 1.19.6 creadas mediante MCP HTTP tienen un
+proceso propietario que mantiene la conexión ACP original cuando se reinicia
+solo el Scheduler. OpenCode conserva el historial en su propia base de datos
+por sesión bajo el directorio de estado privado. El registro del Scheduler
+conserva únicamente metadatos. El propietario registra la respuesta ACP
+correlacionada con el último turno ordinario. Esa versión de OpenCode responde
+al recibir la señal explícita de que la sesión está libre. La reconciliación
+comprueba que el propietario sigue activo y que coinciden el ID nativo,
+el workspace y el turno. La fuente registrada es `opencode_owner`.
+
+Si el propietario terminó, el turno no produjo esa evidencia o la sesión
+de OpenCode fue importada sin propietario verificado, el Scheduler conserva
+el bloqueo. Detener todo el árbol de procesos también detiene al propietario.
+Los comandos de barra de OpenCode conservan su flujo ACP en vivo. Reconciliar
+después de un reinicio requiere evidencia de un turno ordinario.
+
+Para un adaptador Codex con evidencia propia, la respuesta de `session/load`
+debe incluir `_meta["session-scheduler/sessionState"]` con el mismo
+`sessionId`, `cwd` y `status: "idle"`. El adaptador verifica el estado
+actual en la instancia propietaria. Para reconciliar un turno, la respuesta
+también debe incluir el `turnOutcome` correlacionado con el ID enviado
+en `params._meta["session-scheduler/promptRequestId"]`. La fuente registrada
+es `acp_session_load`.
+
+`inspect_session` incluye la fuente, el turno y la fecha de la observación.
+Reconciliar no envía prompts ni emite eventos. `follow_up` vuelve a verificar
+la evidencia, comprueba la confianza vigente del workspace y rechaza una
+observación que contradiga el último desenlace confirmado. El turno nuevo
+tiene su propio evento de finalización.
 
 ## Registro local en Codex Desktop
 
@@ -184,3 +252,15 @@ pwsh -NoProfile -File tests/windows_private_events_smoke.ps1 `
   -ProxyWorkspace $proxyWorkspace -ReadOnlyPrompt $prompt `
   -ExpectedOutput $expectedOutput
 ```
+
+Para verificar la reconciliación del propietario de OpenCode 1.19.6, ejecuta
+la prueba aislada en Windows con Node.js y los binarios de desarrollo:
+
+```powershell
+node tests/opencode_owner_windows.cjs $schedulerExe $openCodeExe
+```
+
+La prueba conserva el mismo puerto MCP y estado al reiniciar solo el Scheduler.
+Abre dos sesiones de OpenCode con un modelo HTTP de prueba en loopback. Deja
+una ocupada mientras reconcilia la otra y comprueba el mismo ID nativo, los
+envíos bloqueados y una única entrega firmada del turno nuevo.

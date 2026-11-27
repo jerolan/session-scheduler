@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
@@ -15,14 +15,16 @@ pub enum StateFile {
     Subscriptions,
     PendingEvents,
     Workspaces,
+    OpenCodeOwner(Uuid),
 }
 
 impl StateFile {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> String {
         match self {
-            Self::Subscriptions => "event-subscriptions.json",
-            Self::PendingEvents => "pending-events.json",
-            Self::Workspaces => "trusted-workspaces.json",
+            Self::Subscriptions => "event-subscriptions.json".into(),
+            Self::PendingEvents => "pending-events.json".into(),
+            Self::Workspaces => "trusted-workspaces.json".into(),
+            Self::OpenCodeOwner(id) => format!("owner-{id}.json"),
         }
     }
 }
@@ -57,11 +59,14 @@ impl StateFiles {
     }
 
     pub fn read(&self, kind: StateFile) -> io::Result<Option<File>> {
-        let path = self.directory.join(kind.name());
+        self.read_private(&self.directory.join(kind.name()))
+    }
+
+    fn read_private(&self, path: &Path) -> io::Result<Option<File>> {
         #[cfg(unix)]
-        let result = match fs::symlink_metadata(&path) {
+        let result = match fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_file() && meta.permissions().mode() & 0o077 == 0 => {
-                File::open(&path)
+                File::open(path)
             }
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -70,12 +75,46 @@ impl StateFiles {
             Err(error) => Err(error),
         };
         #[cfg(windows)]
-        let result = self.access.read(&path);
+        let result = self.access.read(path);
         match result {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    pub fn remove_owner(&self, id: Uuid) -> io::Result<()> {
+        fs::remove_file(self.directory.join(StateFile::OpenCodeOwner(id).name()))
+    }
+
+    pub fn database_path(&mut self) -> io::Result<PathBuf> {
+        self.private_database_path("registry", "sessions.sqlite")
+    }
+
+    pub fn opencode_database_path(&mut self, id: Uuid) -> io::Result<PathBuf> {
+        self.private_database_path("opencode", &format!("{id}.sqlite"))
+    }
+
+    fn private_database_path(&mut self, subdir: &str, name: &str) -> io::Result<PathBuf> {
+        // SQLite creates rollback journals alongside the database.
+        let directory = self.directory.join(subdir);
+        #[cfg(unix)]
+        Self::open(directory.clone())?;
+        #[cfg(windows)]
+        self.access.open_registry_directory(&directory)?;
+
+        let path = directory.join(name);
+        if self.read_private(&path)?.is_none() {
+            #[cfg(unix)]
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            #[cfg(windows)]
+            self.access.create(&path)?;
+        }
+        Ok(path)
     }
 
     pub fn replace(
